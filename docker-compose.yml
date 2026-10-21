@@ -35,8 +35,16 @@ services:
       DATABASE_URL: postgresql+psycopg://payment:payment@db:5432/payment
       PUBLIC_BASE_URL: http://localhost:8000
       GATEWAY_WEBHOOK_SECRET: ${GATEWAY_WEBHOOK_SECRET:-dev-only-webhook-secret}
+      # Dev token: docker compose exec api python -m payment_service.auth --order-id <uuid>
+      AUTH_TOKEN_SECRET: ${AUTH_TOKEN_SECRET:-dev-only-auth-token-secret}
+      AUTH_DISABLED: ${AUTH_DISABLED:-false}
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     depends_on:
       migrate:
         condition: service_completed_successfully

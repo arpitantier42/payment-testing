@@ -34,13 +34,29 @@ export function isUuid(value) {
 
 const CURRENCY_RE = /^[A-Z]{3}$/i;
 
-/** Format minor units with their currency; returns null when either is missing (never a bare number). */
+/** Exact decimal string for `amount` minor units with `digits` fraction digits (no float arithmetic). */
+export function minorToDecimal(amount, digits) {
+  const negative = amount < 0;
+  const units = String(Math.abs(amount)).padStart(digits + 1, "0");
+  const whole = units.slice(0, units.length - digits);
+  const fraction = digits > 0 ? `.${units.slice(units.length - digits)}` : "";
+  return `${negative ? "-" : ""}${whole}${fraction}`;
+}
+
+/**
+ * Format the backend's minor units with their currency; returns null when either is missing
+ * (never a bare number). The value is the backend's exactly: the decimal point is placed by the
+ * currency's own minor-unit exponent (JPY 0, INR 2, KWD 3), never rounded or recomputed.
+ */
 export function formatAmount(amount, currency) {
-  if (!Number.isInteger(amount) || typeof currency !== "string" || !CURRENCY_RE.test(currency)) return null;
+  if (!Number.isSafeInteger(amount) || typeof currency !== "string" || !CURRENCY_RE.test(currency)) return null;
+  const code = currency.toUpperCase();
   try {
-    return new Intl.NumberFormat(undefined, { style: "currency", currency }).format(amount / 100);
+    const format = new Intl.NumberFormat(undefined, { style: "currency", currency: code });
+    const digits = format.resolvedOptions().maximumFractionDigits;
+    return format.format(minorToDecimal(amount, digits));
   } catch {
-    return `${(amount / 100).toFixed(2)} ${currency}`;
+    return `${minorToDecimal(amount, 2)} ${code}`;
   }
 }
 
@@ -52,8 +68,11 @@ export const REQUEST_TIMEOUT_MS = 15000;
  * API client. A request that gets no answer within `timeoutMs` is aborted and reported
  * as a NetworkError, so no view ever waits on the network indefinitely.
  */
-export function createApi(fetchImpl, baseUrl = "", { timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
+export function createApi(fetchImpl, baseUrl = "", { timeoutMs = REQUEST_TIMEOUT_MS, getToken = () => null } = {}) {
   async function request(path, options = {}) {
+    // The customer's session token (never a gateway credential) goes in Authorization.
+    const token = getToken();
+    if (token) options = { ...options, headers: { ...(options.headers || {}), Authorization: `Bearer ${token}` } };
     let response;
     const controller = typeof AbortController === "function" ? new AbortController() : null;
     let timer = null;
@@ -104,9 +123,34 @@ export function createApi(fetchImpl, baseUrl = "", { timeoutMs = REQUEST_TIMEOUT
 export function validateOrder(order) {
   const errors = [];
   if (!order || !isUuid(order.id)) errors.push("The order ID is missing.");
-  if (!order || !Number.isInteger(order.amount_minor) || order.amount_minor <= 0) errors.push("The payable amount is missing.");
+  if (!order || typeof order.summary !== "string" || !order.summary.trim()) errors.push("The order summary is missing.");
+  if (!order || !Number.isSafeInteger(order.amount_minor) || order.amount_minor <= 0) errors.push("The payable amount is missing.");
   if (!order || typeof order.currency !== "string" || !CURRENCY_RE.test(order.currency)) errors.push("The currency is missing.");
   return errors;
+}
+
+/**
+ * What the order section shows, decided from the getOrder outcome alone (WI-003):
+ * `{ ok: true, orderId, summary, amount }` with every field taken verbatim from the backend's
+ * order, or `{ ok: false, message }` when the order failed to load or is incomplete; the page then
+ * clears every field, so it never shows a blank id, a bare number or a stale amount.
+ */
+export function orderView({ order = null, error = null } = {}) {
+  if (error) {
+    const message =
+      error.status === 404
+        ? "We couldn't find this order."
+        : error.status === 401
+          ? apiErrorMessage(error)
+          : "We couldn't load your order. Please try again.";
+    return { ok: false, message };
+  }
+  const problems = validateOrder(order);
+  const amount = problems.length ? null : formatAmount(order.amount_minor, order.currency);
+  if (problems.length || amount === null) {
+    return { ok: false, message: `${(problems.length ? problems : ["The payable amount is missing."]).join(" ")} Please try again later.` };
+  }
+  return { ok: true, orderId: order.id, summary: order.summary, amount };
 }
 
 /** Methods the backend allows for this order (all three when it does not say). */
@@ -130,6 +174,28 @@ export function validatePaymentInput({ order, paymentMethod }) {
 // --- storage keys -------------------------------------------------------------------
 
 export const paymentIdStorageKey = (orderId) => `payment:id:${orderId}`;
+export const ACCESS_TOKEN_STORAGE_KEY = "payment:access-token";
+
+/**
+ * The customer's bearer token for payment-service. Order placement opens the page with
+ * `#token=...` (a fragment is never sent to servers or written to access logs); it is kept
+ * in sessionStorage for this tab, so the result page after the gateway redirect has it too.
+ * Returns `{ token, consumedFromHash }` so the caller can strip the fragment from the URL.
+ */
+export function readAccessToken({ hash, storage }) {
+  const fromHash = new URLSearchParams(String(hash || "").replace(/^#/, "")).get("token");
+  if (fromHash) {
+    storage.setItem(ACCESS_TOKEN_STORAGE_KEY, fromHash);
+    return { token: fromHash, consumedFromHash: true };
+  }
+  return { token: storage.getItem(ACCESS_TOKEN_STORAGE_KEY), consumedFromHash: false };
+}
+
+/** Customer-facing text for an API error (401 = the session token is missing/expired). */
+export function apiErrorMessage(err, fallback) {
+  if (err && err.status === 401) return "Your session has expired. Please return to your order and open the payment page again.";
+  return (err && err.message) || fallback;
+}
 
 // --- Pay Now ----------------------------------------------------------------------------
 
@@ -198,6 +264,12 @@ export function createPayNowController({
           message: payment.failure_reason || "The payment could not be started.",
           paymentId: payment.id,
         });
+        return { sent: true, payment };
+      }
+      if (payment.status === "success") {
+        // A replayed key of an attempt that already succeeded (e.g. a new tab): show the
+        // confirmed result and keep Pay Now locked instead of sending the customer to pay again.
+        await confirmReturn(payment.id);
         return { sent: true, payment };
       }
       // Stay "in flight": the page is leaving for the gateway checkout. If the page is

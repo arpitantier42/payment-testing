@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, StrictInt, ValidationError
 from sqlalchemy.orm import Session
 
 from payment_service.api.errors import ApiError
+from payment_service.api.security import PrincipalDep, require_principal
 from payment_service.config import Settings
 from payment_service.db import repository as repo
 from payment_service.db.models import Order as OrderProjection
@@ -24,7 +25,10 @@ from payment_service.integrations.gateway import (
 )
 from payment_service.integrations.orders import Order, OrderService, OrderServiceError
 
-router = APIRouter(prefix="/api/v1")
+# Customer endpoints: every route here requires a valid bearer token (contract scheme `bearer`).
+router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_principal)])
+# Gateway-to-server endpoints: authenticated by X-API-Key + HMAC signature instead.
+webhook_router = APIRouter(prefix="/api/v1")
 
 
 def get_session(request: Request) -> Iterator[Session]:
@@ -88,10 +92,13 @@ def _load_or_project_order(session: Session, orders: OrderService, order_id: uui
 
 @router.get("/orders/{order_id}")
 def get_order(
-    order_id: str, session: SessionDep, orders: Annotated[OrderService, Depends(get_order_service)]
+    order_id: str,
+    session: SessionDep,
+    principal: PrincipalDep,
+    orders: Annotated[OrderService, Depends(get_order_service)],
 ) -> dict:
     parsed = _parse_uuid(order_id)
-    if parsed is None:
+    if parsed is None or not principal.may_access_order(parsed):
         raise ApiError(404, "order_not_found", "Order not found")
     projection = _load_or_project_order(session, orders, parsed)
     repo.ensure_payment_idempotency_key(session, projection)
@@ -117,6 +124,13 @@ class CreatePaymentRequest(BaseModel):
     currency: str | None = None
 
 
+def _differs(body: CreatePaymentRequest, amount_minor: int, currency: str) -> bool:
+    """True when the client sent an amount or currency other than the given one."""
+    return (body.amount_minor is not None and body.amount_minor != amount_minor) or (
+        body.currency is not None and body.currency.upper() != currency
+    )
+
+
 def _payment_response(payment: Payment, status_code: int = 200) -> JSONResponse:
     return JSONResponse(payment.to_dict(), status_code=status_code)
 
@@ -125,8 +139,10 @@ def _payment_response(payment: Payment, status_code: int = 200) -> JSONResponse:
 def create_payment(
     body: CreatePaymentRequest,
     session: SessionDep,
+    principal: PrincipalDep,
     settings: Annotated[Settings, Depends(get_settings)],
     gateway: Annotated[PaymentGateway, Depends(get_gateway)],
+    orders: Annotated[OrderService, Depends(get_order_service)],
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> JSONResponse:
     try:
@@ -134,21 +150,27 @@ def create_payment(
     except repo.PaymentValidationError as exc:
         raise ApiError(400, "invalid_request", str(exc)) from exc
     assert idempotency_key is not None
+    if not principal.may_access_order(order_id):
+        raise ApiError(404, "order_not_found", "Order not found")
 
     # A replay of the same attempt returns the original payment without new side effects.
     existing = repo.get_payment_by_idempotency_key(session, idempotency_key)
     if existing is not None:
-        if existing.order_id != order_id:
+        if existing.order_id != order_id or _differs(body, existing.amount_minor, existing.currency):
             raise ApiError(409, "idempotency_conflict", "Idempotency-Key was already used for a different payment")
         return _payment_response(existing, 200)
 
     order = repo.get_order(session, order_id)
     if order is None:
         raise ApiError(404, "order_not_found", "Order not found")
-    if (body.amount_minor is not None and body.amount_minor != order.amount_minor) or (
-        body.currency is not None and body.currency.upper() != order.currency
-    ):
+    if _differs(body, order.amount_minor, order.currency):
         raise ApiError(400, "amount_mismatch", "Amount or currency does not match the order")
+
+    # Step 1 (REQ-006): revalidate against order-service before anything is stored or charged.
+    # The projection is never overwritten (RSK-002), so a changed order is refused, not followed.
+    current = _fetch_order(orders, order_id)
+    if current.amount_minor != order.amount_minor or current.currency.upper() != order.currency:
+        raise ApiError(409, "order_changed", "The order amount has changed; please contact support")
 
     try:
         payment, created = repo.create_payment(
@@ -176,10 +198,10 @@ def create_payment(
             payment_method=payment.payment_method,
             return_url=return_url,
         )
-    except GatewayError as exc:
-        repo.update_payment_status(
-            session, payment, PaymentStatus.FAILED, failure_reason=f"Gateway rejected initiation: {exc}"
-        )
+    except Exception as exc:  # GatewayError, or a transport failure in a real adapter
+        # Never leave the attempt `initiated`: a failed row frees the order for a retry with a new key.
+        reason = f"Gateway rejected initiation: {exc}" if isinstance(exc, GatewayError) else "Gateway did not respond"
+        repo.update_payment_status(session, payment, PaymentStatus.FAILED, failure_reason=reason)
         session.commit()
         raise ApiError(502, "gateway_error", "The payment gateway could not start this payment") from exc
 
@@ -194,9 +216,9 @@ def create_payment(
 
 
 @router.get("/payments/{payment_id}")
-def get_payment(payment_id: str, session: SessionDep) -> JSONResponse:
+def get_payment(payment_id: str, session: SessionDep, principal: PrincipalDep) -> JSONResponse:
     payment = repo.get_payment(session, payment_id)
-    if payment is None:
+    if payment is None or not principal.may_access_order(payment.order_id):
         raise ApiError(404, "payment_not_found", "Payment not found")
     return _payment_response(payment)
 
@@ -230,7 +252,10 @@ def _resolve_payment(session: Session, data: WebhookData) -> Payment | None:
     return None
 
 
-@router.post("/payments/webhooks/gateway")
+# `/payments/webhook` is the contract path; `/payments/webhooks/gateway` is kept for
+# gateways already configured with it.
+@webhook_router.post("/payments/webhook")
+@webhook_router.post("/payments/webhooks/gateway")
 async def receive_gateway_webhook(
     request: Request,
     session: SessionDep,

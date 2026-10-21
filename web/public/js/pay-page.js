@@ -2,12 +2,15 @@ import {
   availableMethods,
   createApi,
   createPayNowController,
-  formatAmount,
   isUuid,
-  validateOrder,
+  orderView,
+  readAccessToken,
 } from "./payment.js";
 
-const api = createApi(window.fetch.bind(window));
+const { token, consumedFromHash } = readAccessToken({ hash: window.location.hash, storage: window.sessionStorage });
+// Drop the token from the address bar so it is not bookmarked, shared or kept in history.
+if (consumedFromHash) window.history.replaceState(null, "", window.location.pathname + window.location.search);
+const api = createApi(window.fetch.bind(window), "", { getToken: () => token });
 const params = new URLSearchParams(window.location.search);
 const orderId = params.get("orderId");
 
@@ -124,23 +127,24 @@ async function loadOrder({ keepMessage = false } = {}) {
     showOrderUnavailable("No valid order was found. Please return to your order and try again.");
     return;
   }
-  let loaded;
+  let loaded = null;
+  let error = null;
   try {
     loaded = await api.getOrder(orderId);
   } catch (err) {
-    showOrderUnavailable(err.status === 404 ? "We couldn't find this order." : "We couldn't load your order. Please try again.");
-    return;
+    error = err;
   }
-  const problems = validateOrder(loaded);
-  if (problems.length) {
-    showOrderUnavailable(`${problems.join(" ")} Please try again later.`);
+  // Every field shown comes verbatim from this response; on any problem all are cleared.
+  const view = orderView({ order: loaded, error });
+  if (!view.ok) {
+    showOrderUnavailable(view.message);
     return;
   }
   const selected = els.form.querySelector("input[name=payment_method]:checked");
   order = loaded;
-  els.orderId.textContent = order.id;
-  els.summary.textContent = order.summary;
-  els.amount.textContent = formatAmount(order.amount_minor, order.currency);
+  els.orderId.textContent = view.orderId;
+  els.summary.textContent = view.summary;
+  els.amount.textContent = view.amount;
   renderMethods(availableMethods(order));
   if (selected) {
     const again = els.form.querySelector(`input[name=payment_method][value="${selected.value}"]`);

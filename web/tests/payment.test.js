@@ -2,13 +2,18 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+  ACCESS_TOKEN_STORAGE_KEY,
   ApiError,
+  apiErrorMessage,
+  readAccessToken,
   NetworkError,
   confirmPaymentStatus,
   createApi,
   availableMethods,
   createPayNowController,
   formatAmount,
+  minorToDecimal,
+  orderView,
   paymentIdStorageKey,
   pollConfirmedStatus,
   resolvePaymentId,
@@ -124,9 +129,77 @@ describe("order display (AC1, AC2, AC3, AC7, AC8)", () => {
     assert.equal(formatAmount(undefined, "INR"), null);
   });
 
+  it("an order without a summary is reported, never shown blank", () => {
+    assert.match(validateOrder({ ...ORDER, summary: "  " }).join(" "), /summary is missing/);
+    assert.match(validateOrder({ ...ORDER, summary: undefined }).join(" "), /summary is missing/);
+  });
+
   it("offers UPI, card and net banking as distinct methods, filtered by the order", () => {
     assert.deepEqual(availableMethods(ORDER).map((m) => m.value), ["upi", "card", "netbanking"]);
     assert.deepEqual(availableMethods({ ...ORDER, available_payment_methods: ["card"] }).map((m) => m.value), ["card"]);
+  });
+});
+
+describe("WI-003 order section (getOrder → what the page shows)", () => {
+  it("AC1: a missing or malformed order id shows an error, not a blank order field", () => {
+    for (const id of [undefined, null, "", "not-a-uuid"]) {
+      const view = orderView({ order: { ...ORDER, id } });
+      assert.equal(view.ok, false);
+      assert.match(view.message, /order ID is missing/);
+      assert.equal(view.orderId, undefined);
+    }
+  });
+
+  it("AC2: without a currency no amount is shown at all", () => {
+    for (const currency of [undefined, null, "", "₹", "RUPEES"]) {
+      const view = orderView({ order: { ...ORDER, currency } });
+      assert.equal(view.ok, false);
+      assert.match(view.message, /currency is missing/);
+      assert.equal(view.amount, undefined);
+      assert.equal(formatAmount(ORDER.amount_minor, currency), null);
+    }
+  });
+
+  it("AC3: a failed getOrder shows an error and no amount (404, 502, timeout, 401)", () => {
+    const cases = [
+      [new ApiError(404, "order_not_found", "Order not found"), /couldn't find this order/],
+      [new ApiError(502, "order_service_unavailable", "Order details are unavailable right now"), /couldn't load your order/],
+      [new NetworkError(new Error("no response within 15000 ms")), /couldn't load your order/],
+      [new ApiError(401, "unauthorized", "x"), /session has expired/],
+    ];
+    for (const [error, message] of cases) {
+      // Even if a previous order object is around, an error never falls back to it.
+      const view = orderView({ order: ORDER, error });
+      assert.equal(view.ok, false);
+      assert.match(view.message, message);
+      assert.equal(view.amount, undefined);
+    }
+    assert.equal(orderView({ order: null }).ok, false);
+    assert.equal(orderView({ order: { ...ORDER, amount_minor: 3499.5 } }).ok, false);
+    assert.equal(orderView({ order: { ...ORDER, amount_minor: "349900" } }).ok, false);
+  });
+
+  it("AC4: renders the backend's exact amount, placed by the currency's own exponent", () => {
+    const view = orderView({ order: ORDER });
+    assert.equal(view.ok, true);
+    assert.equal(view.orderId, ORDER.id);
+    assert.equal(view.summary, ORDER.summary);
+    assert.equal(view.amount, formatAmount(349900, "INR"));
+    assert.match(view.amount, /3,?499\.00/);
+    // Zero- and three-decimal currencies are not divided by 100.
+    assert.match(formatAmount(1500, "JPY"), /1,?500(?![.\d])/);
+    assert.match(formatAmount(1234, "KWD"), /1\.234/);
+    // No float rounding: one minor unit is visible, large amounts are kept digit for digit.
+    assert.match(formatAmount(1, "INR"), /0\.01/);
+    assert.match(formatAmount(900719925474099, "INR"), /9,?007,?199,?254,?740\.99/);
+  });
+
+  it("minorToDecimal places the decimal point without arithmetic", () => {
+    assert.equal(minorToDecimal(349900, 2), "3499.00");
+    assert.equal(minorToDecimal(5, 2), "0.05");
+    assert.equal(minorToDecimal(1500, 0), "1500");
+    assert.equal(minorToDecimal(1234, 3), "1.234");
+    assert.equal(minorToDecimal(-5, 2), "-0.05");
   });
 });
 
@@ -243,12 +316,113 @@ describe("duplicate submissions (AC7, AC8)", () => {
     assert.equal(controller.isInFlight(), true);
   });
 
+  it("a replay that returns an already-successful payment shows success and never redirects", async () => {
+    const { controller, calls, views, navigations } = setup((url, opts) =>
+      opts.method === "POST"
+        ? jsonResponse(200, { id: PAYMENT_ID, order_id: ORDER.id, status: "success", gateway_checkout_url: "https://gateway.example/x" })
+        : jsonResponse(200, { id: PAYMENT_ID, status: "success" }),
+    );
+    await controller.payNow({ order: ORDER, paymentMethod: "upi" });
+    assert.deepEqual(navigations, []);
+    assert.equal(views.at(-1).kind, "confirmed");
+    assert.equal(views.at(-1).result.kind, "success");
+    assert.equal(calls.at(-1).url, `/api/v1/payments/${PAYMENT_ID}`); // confirmed via GET
+    assert.equal(controller.isInFlight(), true);
+  });
+
   it("unlocks after an error so the customer can retry", async () => {
     const { controller, calls } = setup((u, o, n) => (n === 1 ? jsonResponse(500, {}) : created()));
     await controller.payNow({ order: ORDER, paymentMethod: "upi" });
     assert.equal(controller.isInFlight(), false);
     await controller.payNow({ order: ORDER, paymentMethod: "upi" });
     assert.equal(calls.length, 2);
+  });
+});
+
+describe("WI-004 Pay Now → POST /api/v1/payments", () => {
+  const sentMethod = (call) => JSON.parse(call.options.body).payment_method;
+
+  it("AC1: Pay Now without a selected method is a validation message and no request", async () => {
+    for (const paymentMethod of [null, undefined, ""]) {
+      const { controller, calls, views } = setup(() => created());
+      assert.equal((await controller.payNow({ order: ORDER, paymentMethod })).sent, false);
+      assert.equal(calls.length, 0);
+      assert.equal(views.at(-1).kind, "validation");
+      assert.match(views.at(-1).messages.join(" "), /payment method/i);
+      assert.equal(controller.isInFlight(), false); // still clickable once a method is chosen
+    }
+  });
+
+  it("AC2, AC7: with a method selected Pay Now makes exactly one REST POST /api/v1/payments", async () => {
+    const { controller, calls } = setup(() => created());
+    await controller.payNow({ order: ORDER, paymentMethod: "card" });
+    assert.deepEqual(calls.map((c) => [c.options.method, c.url]), [["POST", "/api/v1/payments"]]);
+    assert.equal(calls[0].options.headers["Content-Type"], "application/json");
+  });
+
+  it("AC3: the selected method is the one sent", async () => {
+    for (const method of ["upi", "card", "netbanking"]) {
+      const { controller, calls } = setup(() => created());
+      await controller.payNow({ order: ORDER, paymentMethod: method });
+      assert.equal(sentMethod(calls[0]), method);
+    }
+  });
+
+  it("AC4: changing the selection before clicking changes the method submitted", async () => {
+    // First attempt with UPI is answered with an error; the customer switches to card and clicks again.
+    const { controller, calls } = setup((u, o, n) => (n === 1 ? jsonResponse(400, { error: { message: "no" } }) : created()));
+    await controller.payNow({ order: ORDER, paymentMethod: "upi" });
+    await controller.payNow({ order: ORDER, paymentMethod: "card" });
+    assert.deepEqual(calls.map(sentMethod), ["upi", "card"]);
+  });
+
+  it("AC5: missing order id, amount or method sends nothing and shows an error", async () => {
+    for (const input of [
+      { order: { ...ORDER, id: undefined }, paymentMethod: "upi" },
+      { order: { ...ORDER, amount_minor: undefined }, paymentMethod: "upi" },
+      { order: ORDER, paymentMethod: null },
+    ]) {
+      const { controller, calls, views, navigations } = setup(() => created());
+      await controller.payNow(input);
+      assert.equal(calls.length, 0);
+      assert.equal(views.at(-1).kind, "validation");
+      assert.deepEqual(navigations, []);
+    }
+  });
+
+  it("AC6, AC8: every non-success response (400/401/404/409/502) is an error view, never a redirect", async () => {
+    for (const status of [400, 401, 404, 409, 502]) {
+      const { controller, views, navigations } = setup(() =>
+        jsonResponse(status, { error: { code: "x", message: `refused ${status}` } }),
+      );
+      await controller.payNow({ order: ORDER, paymentMethod: "upi" });
+      assert.equal(views.at(-1).kind, "api");
+      assert.equal(views.at(-1).status, status);
+      assert.deepEqual(navigations, []);
+    }
+  });
+
+  it("AC9: a second click while the first is in flight sends nothing, even with another method", async () => {
+    const pending = deferred();
+    const { controller, calls } = setup(() => pending.promise);
+    const first = controller.payNow({ order: ORDER, paymentMethod: "upi" });
+    assert.deepEqual(await controller.payNow({ order: ORDER, paymentMethod: "card" }), { ignored: true });
+    pending.resolve(created());
+    await first;
+    assert.equal(calls.length, 1);
+    assert.equal(sentMethod(calls[0]), "upi");
+  });
+
+  it("AC10: a rapid double click (same tick) sends exactly one request", async () => {
+    const pending = deferred();
+    const { controller, calls, views } = setup(() => pending.promise);
+    const a = controller.payNow({ order: ORDER, paymentMethod: "upi" });
+    const b = controller.payNow({ order: ORDER, paymentMethod: "upi" });
+    assert.equal(calls.length, 1);
+    assert.equal(views.at(-1).submitting, true);
+    pending.resolve(created());
+    await Promise.all([a, b]);
+    assert.equal(calls.length, 1);
   });
 });
 
@@ -451,5 +625,65 @@ describe("api client", () => {
     await assert.rejects(down.getPayment(PAYMENT_ID), NetworkError);
     const notFound = createApi(() => jsonResponse(404, { error: { code: "payment_not_found", message: "nope" } }));
     await assert.rejects(notFound.getPayment(PAYMENT_ID), (err) => err instanceof ApiError && err.status === 404);
+  });
+});
+
+describe("bearer session token (REQ-017: only the customer's own token, never a gateway credential)", () => {
+  it("sends the token as Authorization: Bearer on every call", async () => {
+    const seen = [];
+    const fetch = (url, options = {}) => {
+      seen.push({ url, headers: options.headers || {} });
+      return jsonResponse(200, { id: PAYMENT_ID, status: "pending" });
+    };
+    const api = createApi(fetch, "", { getToken: () => "tok-123" });
+    await api.getOrder(ORDER.id);
+    await api.getPayment(PAYMENT_ID);
+    await api.createPayment({ order_id: ORDER.id, payment_method: "upi" }, "key-1");
+    assert.equal(seen.length, 3);
+    for (const call of seen) assert.equal(call.headers.Authorization, "Bearer tok-123");
+    assert.equal(seen[2].headers["Idempotency-Key"], "key-1");
+  });
+
+  it("sends no Authorization header when there is no token", async () => {
+    let headers;
+    const api = createApi((url, options = {}) => {
+      headers = options.headers;
+      return jsonResponse(200, {});
+    });
+    await api.getOrder(ORDER.id);
+    assert.equal(headers, undefined);
+  });
+
+  it("takes the token from the URL fragment once and keeps it for the tab", () => {
+    const storage = memoryStorage();
+    assert.deepEqual(readAccessToken({ hash: "#token=abc.def", storage }), { token: "abc.def", consumedFromHash: true });
+    assert.equal(storage.getItem(ACCESS_TOKEN_STORAGE_KEY), "abc.def");
+    // Result page after the gateway redirect: no fragment, same tab storage.
+    assert.deepEqual(readAccessToken({ hash: "", storage }), { token: "abc.def", consumedFromHash: false });
+    assert.deepEqual(readAccessToken({ hash: "", storage: memoryStorage() }), { token: null, consumedFromHash: false });
+  });
+
+  it("explains an expired session instead of a generic error", () => {
+    assert.match(apiErrorMessage(new ApiError(401, "unauthorized", "x")), /session has expired/);
+    assert.equal(apiErrorMessage(new ApiError(400, "invalid_request", "bad"), "fallback"), "bad");
+    assert.equal(apiErrorMessage(null, "fallback"), "fallback");
+  });
+
+  it("a 401 on Pay Now is shown as an error and does not redirect", async () => {
+    const views = [];
+    const navigated = [];
+    const fetch = () => jsonResponse(401, { error: { code: "unauthorized", message: "Your session is invalid." } });
+    const controller = createPayNowController({
+      api: createApi(fetch, "", { getToken: () => "expired" }),
+      storage: memoryStorage(),
+      navigate: (url) => navigated.push(url),
+      render: (v) => views.push(v),
+      setTimer: () => {},
+    });
+    await controller.payNow({ order: ORDER, paymentMethod: "upi" });
+    assert.equal(navigated.length, 0);
+    assert.equal(views.at(-1).kind, "api");
+    assert.equal(views.at(-1).status, 401);
+    assert.equal(controller.isInFlight(), false);
   });
 });

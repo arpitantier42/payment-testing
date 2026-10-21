@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir .
 COPY web/public ./web/public
 COPY dev ./dev
 
-# DATABASE_URL and GATEWAY_WEBHOOK_SECRET must be provided at runtime; no secrets are baked in.
+# DATABASE_URL, GATEWAY_WEBHOOK_SECRET and AUTH_TOKEN_SECRET must be provided at runtime
+# (the service refuses to start without them); no secrets are baked in.
 EXPOSE 8000
 CMD ["uvicorn", "--factory", "payment_service.api.app:create_app", "--host", "0.0.0.0", "--port", "8000"]

@@ -18,47 +18,68 @@ Design docs (OpenAPI, data model, HLD/LLD) come with each ticket.
 pyproject.toml                 dependencies, pytest config (pythonpath=src)
 alembic.ini                    Alembic config; URL comes from DATABASE_URL
 src/payment_service/
-  config.py                    Settings.from_env(): DATABASE_URL, PUBLIC_BASE_URL, GATEWAY_WEBHOOK_SECRET, ...
-  api/app.py                   create_app(settings, session_factory=, order_service=, gateway=) factory
-  api/routes.py                /api/v1 routes: orders, payments, gateway webhook
-  api/errors.py                ApiError + handlers; validation errors -> 400
+  config.py                    Settings.from_env() + validate() (ConfigError); secrets have repr=False
+  auth.py                      bearer tokens: issue_token / verify_token -> Principal; dev CLI (python -m)
+  secret_scan.py               REQ-017 scan of web/public (python -m payment_service.secret_scan)
+  api/app.py                   create_app(settings, session_factory=, order_service=, gateway=) factory; /healthz
+  api/routes.py                /api/v1 routes: `router` (customer, bearer) + `webhook_router` (gateway)
+  api/security.py              require_principal dependency (router-level on `router`), PrincipalDep
+  api/errors.py                ApiError(+headers) + handlers; validation errors -> 400
   db/models.py                 ORM: Order (orders projection), Payment (payments), GatewayWebhookEvent
   db/session.py                make_engine / make_sessionmaker (SQLite tweaks for tests)
   db/repository.py             data-access functions + domain errors
   db/migrations/               Alembic env + versions/NNNN_description.py
-  integrations/orders.py       OrderService protocol + InMemoryOrderService stub (reads dev/orders.json)
+  integrations/orders.py       OrderService protocol, parse_order_payload (wire shape), HttpOrderService
+                               (assumed contract), InMemoryOrderService stub (dev/orders.json), probe CLI
   integrations/gateway.py      PaymentGateway protocol + FakeGateway stub, HMAC sign/verify
 web/public/                    index.html (pay page), result.html (confirmed result), js/, styles.css
 web/tests/                     node --test unit tests for js/payment.js
 dev/orders.json                demo order for the order-service stub
 tests/                         conftest.py (migrated DB per test), test_*.py
-docker-compose.yml, Dockerfile Postgres, migration runner, API
-Makefile                       install / test / test-web / run / migrate / db-up / test-pg
+tests/e2e/pay_flow.test.mjs    node --test: payment.js against a live server (run by test_e2e_payment_flow.py)
+docs/acceptance/WI-<n>.md      acceptance criterion → code → tests map, per ticket (WI-002.md = spike, ≠ WI-2.md)
+docs/spikes/order-service-contract.md  assumed order-service contract, error mapping, open questions
+docker-compose.yml, Dockerfile Postgres, migration runner, API (healthcheck on /healthz)
+.github/workflows/ci.yml       secret scan, pytest on SQLite and Postgres, docker build
+Makefile                       install / test / test-web / scan-web / dev-token / run / migrate / db-up / test-pg
 ```
 
 ## Commands
 - Install: `python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'` (or `make install`)
 - Test everything: `.venv/bin/pytest` (or `make test`). Frontend only: `cd web && npm test`.
 - Run locally on SQLite: `DATABASE_URL=sqlite:///./dev.db GATEWAY_WEBHOOK_SECRET=dev .venv/bin/alembic upgrade head`
-  then `make run` with the same env; open `http://localhost:8000/pay/?orderId=6f1c2b8e-3d4a-4c5b-9e7f-112233445566`.
-- Postgres via Docker: `docker compose up api` (starts db, runs migrations, serves on :8000).
+  then `make run` with the same env plus `AUTH_TOKEN_SECRET=<16+ chars>`; `make dev-token` (same env) prints a
+  pay-page URL with `#token=...`. Or set `AUTH_DISABLED=true` and open
+  `http://localhost:8000/pay/?orderId=6f1c2b8e-3d4a-4c5b-9e7f-112233445566`.
+- Postgres via Docker: `docker compose up api` (starts db, runs migrations, serves on :8000); token:
+  `docker compose exec api python -m payment_service.auth --order-id <uuid>`.
+- Real order-service: set `ORDER_SERVICE_URL` (+ `ORDER_SERVICE_TIMEOUT_SECONDS`, default 3, and optional
+  `ORDER_SERVICE_API_TOKEN`); unset → dev stub. Check a live order-service against the assumed contract:
+  `ORDER_SERVICE_URL=... .venv/bin/python -m payment_service.integrations.orders <order-uuid>`.
+- Secret scan of the page: `make scan-web` (also in CI and `tests/test_secret_scan.py`).
 - Tests on Postgres: `make test-pg` (uses the `payment_test` database created by compose).
 - New migration: `.venv/bin/alembic revision -m "..."`, then rename the file to `NNNN_description.py`
   with `revision = "NNNN"`.
 
 ## API (see ticket OpenAPI)
+- Customer endpoints (orders, payments) need `Authorization: Bearer <token>` → else 401 `unauthorized` with
+  `WWW-Authenticate: Bearer`. A token scoped to an order (`order_id` claim) gets 404 for any other order and
+  its payments. Webhook and `/healthz` take no bearer token.
 - `GET /api/v1/orders/{orderId}` → 200 Order `{id, summary, amount_minor, currency, available_payment_methods,
-  payment_idempotency_key, created_at}` | 404 | 502 (order-service failure and no cached projection).
+  payment_idempotency_key, created_at}` | 404 | 502 (order-service failure and no cached projection; nothing cached).
   Projects the order into `orders` on first sight (cache; never overwritten) and issues/rotates the key.
 - `POST /api/v1/payments` (header `Idempotency-Key` = the order's `payment_idempotency_key`, body
   `order_id, payment_method, amount_minor?, currency?`) → 201 new Payment | 200 replay of the key |
   400 missing/invalid/unknown field, method not available, key not issued for the order, or amount/currency ≠ order |
-  404 order never projected | 409 key used for another order | 502 gateway refused (payment stored as failed).
-  Amount/currency are always copied from the projection.
+  404 order never projected or gone at order-service | 409 key used for another order or (replay) another
+  amount/currency, or `order_changed` (order-service now reports another amount/currency than the projection) |
+  502 gateway refused or raised anything (payment stored as failed, never left `initiated`) or order-service down.
+  A new attempt (not a replay) revalidates the order with order-service before the insert (WI-004 step 1);
+  nothing is stored or charged when that fails. Amount/currency are always copied from the projection.
 - Payment JSON: `id, order_id, status, payment_method, amount_minor, currency, idempotency_key,
   gateway_session_id, gateway_checkout_url, failure_reason, created_at, updated_at`.
 - `GET /api/v1/payments/{paymentId}` → 200 Payment | 404 (unknown or malformed id).
-- `POST /api/v1/payments/webhooks/gateway` (header `X-Gateway-Signature` = hex HMAC-SHA256 of raw body;
+- `POST /api/v1/payments/webhook` (contract path; alias `/api/v1/payments/webhooks/gateway`) (header `X-Gateway-Signature` = hex HMAC-SHA256 of raw body;
   `X-API-Key` checked when `GATEWAY_WEBHOOK_API_KEY` is set). Body
   `{"id", "type": "payment.success|payment.failed|payment.pending", "data": {"payment_id"|"gateway_reference", "failure_reason"?}}`
   (`gateway_reference` is matched against `payments.gateway_session_id`)
@@ -93,8 +114,12 @@ Makefile                       install / test / test-web / run / migrate / db-up
   paymentId stored in sessionStorage from the initiation response. Pay Now is guarded by a
   synchronous in-flight flag + disabled button; the Idempotency-Key is the order's
   `payment_idempotency_key` (never generated client-side); after an answered error/failed attempt the page
-  reloads the order to get the rotated key. An order missing id/amount/currency (`validateOrder`) or an
-  invalid `orderId` disables Pay Now and shows an error. Methods shown = `available_payment_methods`.
+  reloads the order to get the rotated key. An order missing id/summary/amount/currency (`validateOrder`) or an
+  invalid `orderId` disables Pay Now and shows an error. What the order section shows is decided by DOM-free
+  `orderView({order, error})` (WI-003): either all fields verbatim from getOrder or an error with every field
+  cleared (never a stale amount). Amounts are shown only via `formatAmount(amount_minor, currency)`, which places
+  the decimal point by the currency's exponent (`Intl` `maximumFractionDigits`: JPY 0, INR 2, KWD 3) through
+  `minorToDecimal` (string, no float division) and returns null without a valid currency — never `amount / 100`. Methods shown = `available_payment_methods`.
   Distinct views/test ids for validation, network error, API error, failed, pending, success.
 - Never hang (REQ-009 AC2): `createApi` aborts requests after `REQUEST_TIMEOUT_MS` (→ NetworkError);
   after hand-off the Pay Now controller arms a `CHECKOUT_TIMEOUT_MS` timer (injectable `setTimer`) that
@@ -106,9 +131,33 @@ Makefile                       install / test / test-web / run / migrate / db-up
 - order-service and gateway are external: code against the `OrderService` / `PaymentGateway`
   protocols; the in-repo implementations are dev stubs. `orders` is a local projection of
   order-service data (assumed immutable once placed, HLD RSK-002); `payments.order_id` → `orders.id` FK.
+  order-service contract (WI-002 spike, `docs/spikes/order-service-contract.md`, still unconfirmed):
+  `GET {ORDER_SERVICE_URL}/orders/{id}` → 200 `{id, summary, amount|amount_minor (int minor units), currency,
+  created_at (with offset), available_payment_methods?}` / 404 → `None` (getOrder 404) / anything else, timeout,
+  connection error → `OrderServiceError`; a 200 outside the shape → `OrderPayloadError` (subclass) — both getOrder
+  502, nothing cached. Only `parse_order_payload` knows the wire shape; change it there if the real contract
+  differs. Tests: `tests/test_order_service_contract.py` (`FakeOrderServer` plays order-service over HTTP).
   `payments.gateway_session_id`/`gateway_checkout_url` stay nullable because a gateway-refused attempt is
   kept as a failed row (the data model's NOT NULL / "gateway before write" is not adopted yet).
 - Secrets only via environment variables (server side); `.env` is git-ignored, `.env.example` is
-  the template. Nothing under `web/` may reference a gateway secret (checked in `tests/test_api.py`).
-- Not built yet: bearer authentication on the customer endpoints (contract lists `bearer`),
-  real order-service/gateway adapters, fallback gateway status polling.
+  the template. `create_app` calls `Settings.validate()`: no `GATEWAY_WEBHOOK_SECRET`, or no
+  `AUTH_TOKEN_SECRET` (≥16 chars) unless `AUTH_DISABLED=true`, → `ConfigError` at startup. New secret settings:
+  add with `field(repr=False)`, list in `secret_scan.SECRET_SETTINGS`, document in `.env.example`.
+  Nothing under `web/` may reference a gateway secret (`secret_scan`, `tests/test_api.py`).
+- Auth (HLD RSK-004, placeholder until the real session issuer is known): tokens are
+  `b64url(json{sub, exp, order_id?}).b64url(HMAC-SHA256)` keyed by `AUTH_TOKEN_SECRET`. New customer routes go
+  on `router` (auth is automatic) and take `principal: PrincipalDep` to check `principal.may_access_order(...)`
+  (mismatch → 404, not 403). Gateway-called routes go on `webhook_router`. Tests: `make_client` in
+  `tests/test_api.py` sends a valid token by default (`token=None` override for none).
+- Frontend auth: the page is opened as `/pay/?orderId=...#token=...`; `readAccessToken` moves the token into
+  sessionStorage (`payment:access-token`), the page strips the fragment, and `createApi(..., {getToken})` sends
+  `Authorization: Bearer`. The token is the customer's session, never a gateway credential.
+- End-to-end acceptance: `tests/test_e2e_payment_flow.py` starts the app with uvicorn on a free port (auth on,
+  FakeGateway, one order per scenario), runs `tests/e2e/pay_flow.test.mjs` (real `payment.js`, real HTTP, signs
+  webhooks as the gateway; kept outside `web/` because it holds the webhook secret), then checks DB invariants.
+  Name each Node test after the criteria it proves (`AC5, AC9: ...`) and keep `docs/acceptance/WI-<n>.md` in step.
+- A replayed POST that returns an already-`success` payment is shown as confirmed success (Pay Now locked), never
+  redirected to the gateway again.
+- Not built yet: the real token issuer (order placement), confirmation of the order-service contract with its
+  owners (adapter exists for the assumed one), real gateway adapter,
+  fallback gateway status polling.
