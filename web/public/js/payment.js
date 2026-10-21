@@ -32,7 +32,11 @@ export function isUuid(value) {
   return typeof value === "string" && UUID_RE.test(value);
 }
 
+const CURRENCY_RE = /^[A-Z]{3}$/i;
+
+/** Format minor units with their currency; returns null when either is missing (never a bare number). */
 export function formatAmount(amount, currency) {
+  if (!Number.isInteger(amount) || typeof currency !== "string" || !CURRENCY_RE.test(currency)) return null;
   try {
     return new Intl.NumberFormat(undefined, { style: "currency", currency }).format(amount / 100);
   } catch {
@@ -42,13 +46,32 @@ export function formatAmount(amount, currency) {
 
 // --- API client ----------------------------------------------------------------
 
-export function createApi(fetchImpl, baseUrl = "") {
+export const REQUEST_TIMEOUT_MS = 15000;
+
+/**
+ * API client. A request that gets no answer within `timeoutMs` is aborted and reported
+ * as a NetworkError, so no view ever waits on the network indefinitely.
+ */
+export function createApi(fetchImpl, baseUrl = "", { timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
   async function request(path, options = {}) {
     let response;
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    let timer = null;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        if (controller) controller.abort();
+        reject(new Error(`no response within ${timeoutMs} ms`));
+      }, timeoutMs);
+    });
     try {
-      response = await fetchImpl(`${baseUrl}${path}`, options);
+      response = await Promise.race([
+        fetchImpl(`${baseUrl}${path}`, controller ? { ...options, signal: controller.signal } : options),
+        timeout,
+      ]);
     } catch (err) {
       throw new NetworkError(err);
+    } finally {
+      clearTimeout(timer);
     }
     let body = null;
     try {
@@ -77,17 +100,35 @@ export function createApi(fetchImpl, baseUrl = "") {
 
 // --- validation (before any request is sent) --------------------------------------
 
-export function validatePaymentInput({ order, paymentMethod }) {
+/** Problems with the order as returned by GET /api/v1/orders/{orderId}; empty when displayable. */
+export function validateOrder(order) {
   const errors = [];
   if (!order || !isUuid(order.id)) errors.push("The order ID is missing.");
-  if (!order || !Number.isInteger(order.amount) || order.amount <= 0) errors.push("The payable amount is missing.");
+  if (!order || !Number.isInteger(order.amount_minor) || order.amount_minor <= 0) errors.push("The payable amount is missing.");
+  if (!order || typeof order.currency !== "string" || !CURRENCY_RE.test(order.currency)) errors.push("The currency is missing.");
+  return errors;
+}
+
+/** Methods the backend allows for this order (all three when it does not say). */
+export function availableMethods(order) {
+  const allowed = order && Array.isArray(order.available_payment_methods) ? order.available_payment_methods : null;
+  return PAYMENT_METHODS.filter((m) => !allowed || allowed.includes(m.value));
+}
+
+export function validatePaymentInput({ order, paymentMethod }) {
+  const errors = validateOrder(order);
   if (!paymentMethod || !METHOD_VALUES.has(paymentMethod)) errors.push("Please select a payment method.");
+  else if (order && !availableMethods(order).some((m) => m.value === paymentMethod)) {
+    errors.push("This payment method is not available for this order.");
+  }
+  if (order && errors.length === 0 && !order.payment_idempotency_key) {
+    errors.push("This payment can't be started yet. Please reload the page.");
+  }
   return errors;
 }
 
 // --- storage keys -------------------------------------------------------------------
 
-export const idempotencyStorageKey = (orderId) => `payment:idempotency-key:${orderId}`;
 export const paymentIdStorageKey = (orderId) => `payment:id:${orderId}`;
 
 // --- Pay Now ----------------------------------------------------------------------------
@@ -98,12 +139,37 @@ export const paymentIdStorageKey = (orderId) => `payment:id:${orderId}`;
  * - Validates input and shows an error instead of calling the API when anything is missing.
  * - Allows exactly one in-flight initiation: the guard is set synchronously, so a second
  *   click (however fast) before the response returns does not send another request.
- * - Reuses the Idempotency-Key for the same attempt when the outcome is unknown (network
- *   error), and starts a fresh key once the backend has answered.
+ * - Sends the Idempotency-Key the backend issued with the order (never one made up here).
+ *   The backend keeps that key until the attempt made with it fails, so a retry after a
+ *   network error replays the same payment; after a failure the page reloads the order
+ *   to receive a fresh key.
  * - Surfaces every failed call as an error view; never proceeds silently.
  */
-export function createPayNowController({ api, storage, newKey, navigate, render }) {
+export const CHECKOUT_TIMEOUT_MS = 10 * 60 * 1000;
+
+export function createPayNowController({
+  api,
+  storage,
+  navigate,
+  render,
+  setTimer = (fn, ms) => setTimeout(fn, ms),
+  checkoutTimeoutMs = CHECKOUT_TIMEOUT_MS,
+}) {
   let inFlight = false;
+  let handoffPaymentId = null;
+
+  /**
+   * The customer is back from (or never reached) the gateway checkout: ask the backend for
+   * the confirmed status and show it (Success / Pending / Failed), unlocking Pay Now unless
+   * the payment succeeded. Never shows a status the backend did not confirm.
+   */
+  async function confirmReturn(paymentId) {
+    handoffPaymentId = null;
+    const result = await confirmPaymentStatus({ api, paymentId, gatewayHint: null });
+    inFlight = result.kind === "success"; // a paid order stays locked
+    render({ kind: "confirmed", submitting: false, locked: inFlight, result, paymentId });
+    return result;
+  }
 
   async function payNow({ order, paymentMethod }) {
     if (inFlight) return { ignored: true };
@@ -117,22 +183,14 @@ export function createPayNowController({ api, storage, newKey, navigate, render 
     inFlight = true;
     render({ kind: "submitting", submitting: true });
 
-    const keyName = idempotencyStorageKey(order.id);
-    let key = storage.getItem(keyName);
-    if (!key) {
-      key = newKey();
-      storage.setItem(keyName, key);
-    }
-
     try {
       const payment = await api.createPayment(
-        { order_id: order.id, payment_method: paymentMethod, amount: order.amount, currency: order.currency },
-        key,
+        { order_id: order.id, payment_method: paymentMethod, amount_minor: order.amount_minor, currency: order.currency },
+        order.payment_idempotency_key,
       );
-      storage.removeItem(keyName);
       storage.setItem(paymentIdStorageKey(order.id), payment.id);
 
-      if (payment.status === "failed" || !payment.checkout_url) {
+      if (payment.status === "failed" || !payment.gateway_checkout_url) {
         inFlight = false;
         render({
           kind: "failed",
@@ -142,24 +200,38 @@ export function createPayNowController({ api, storage, newKey, navigate, render 
         });
         return { sent: true, payment };
       }
-      // Stay "in flight": the page is leaving for the gateway checkout.
+      // Stay "in flight": the page is leaving for the gateway checkout. If the page is
+      // still here after the timeout (checkout blocked, abandoned, or the tab restored),
+      // fall back to the confirmed status instead of spinning indefinitely (HLD NFR-006).
       render({ kind: "redirecting", submitting: true, paymentId: payment.id });
-      navigate(payment.checkout_url);
+      handoffPaymentId = payment.id;
+      setTimer(() => (handoffPaymentId === payment.id ? confirmReturn(payment.id) : null), checkoutTimeoutMs);
+      navigate(payment.gateway_checkout_url);
       return { sent: true, payment };
     } catch (err) {
       inFlight = false;
       if (err instanceof NetworkError) {
-        // Outcome unknown: keep the key so a retry cannot create a second payment.
+        // Outcome unknown: the order still carries the same key, so a retry replays it.
         render({ kind: "network", submitting: false, message: "We couldn't reach the payment service. Check your connection and try again." });
       } else {
-        storage.removeItem(keyName);
         render({ kind: "api", submitting: false, status: err.status, message: err.message || "The payment could not be started." });
       }
       return { sent: true, error: err };
     }
   }
 
-  return { payNow, isInFlight: () => inFlight };
+  /** Called when the pay page is shown again (load, or restored via Back) for this order. */
+  async function resume(orderId) {
+    const paymentId = orderId ? storage.getItem(paymentIdStorageKey(orderId)) : null;
+    if (!paymentId) {
+      inFlight = false;
+      handoffPaymentId = null;
+      return null;
+    }
+    return confirmReturn(paymentId);
+  }
+
+  return { payNow, resume, confirmReturn, isInFlight: () => inFlight };
 }
 
 // --- confirmed result --------------------------------------------------------------------
@@ -220,4 +292,31 @@ export async function confirmPaymentStatus({ api, paymentId, gatewayHint }) {
     overridden: reported !== null && reported !== status,
     message: status === "failed" ? payment.failure_reason || "Your payment failed." : undefined,
   };
+}
+
+export const POLL_ATTEMPTS = 5;
+export const POLL_INTERVAL_MS = 3000;
+
+/**
+ * Confirm the status, re-asking while it is still pending, for at most `attempts` calls.
+ * Every call's view is passed to `onUpdate`, and the last one is returned: the page always
+ * ends on a definite Success / Failed / Pending / error view and never polls forever.
+ */
+export async function pollConfirmedStatus({
+  api,
+  paymentId,
+  gatewayHint,
+  onUpdate = () => {},
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  attempts = POLL_ATTEMPTS,
+  intervalMs = POLL_INTERVAL_MS,
+}) {
+  let view;
+  for (let i = 0; i < attempts; i += 1) {
+    if (i > 0) await sleep(intervalMs);
+    view = await confirmPaymentStatus({ api, paymentId, gatewayHint });
+    onUpdate(view);
+    if (view.kind !== "pending") break;
+  }
+  return view;
 }

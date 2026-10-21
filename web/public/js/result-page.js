@@ -1,4 +1,4 @@
-import { confirmPaymentStatus, createApi, resolvePaymentId } from "./payment.js";
+import { createApi, pollConfirmedStatus, resolvePaymentId } from "./payment.js";
 
 const api = createApi(window.fetch.bind(window));
 const params = new URLSearchParams(window.location.search);
@@ -38,9 +38,12 @@ function render(view) {
   if (canRetry) els.retry.href = `index.html?orderId=${encodeURIComponent(orderId)}`;
 }
 
+// The shown result is always GET /api/v1/payments/{paymentId}. While it is pending (e.g. the
+// customer left checkout and the webhook has not arrived) it is re-checked a few times, then
+// the page settles on Pending with a "Check again" button: it never spins indefinitely.
 async function refresh() {
   els.checkAgain.disabled = true;
-  render(await confirmPaymentStatus({ api, paymentId, gatewayHint }));
+  await pollConfirmedStatus({ api, paymentId, gatewayHint, onUpdate: render });
   els.checkAgain.disabled = false;
 }
 

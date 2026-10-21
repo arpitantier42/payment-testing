@@ -34,8 +34,9 @@ NAMING_CONVENTION = {
     "pk": "%(table_name)s_pkey",
 }
 
-# jsonb on Postgres, plain JSON elsewhere (SQLite in tests).
-JSONPayload = JSON().with_variant(postgresql.JSONB(), "postgresql")
+# jsonb on Postgres, plain JSON elsewhere (SQLite in tests). Python None is stored as
+# SQL NULL (not JSON 'null'), so NOT NULL columns reject a missing value.
+JSONPayload = JSON(none_as_null=True).with_variant(postgresql.JSONB(none_as_null=True), "postgresql")
 
 
 def utcnow() -> datetime:
@@ -65,6 +66,40 @@ class Base(DeclarativeBase):
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
 
 
+class Order(Base):
+    """ENT-002: local, payment-facing projection of an order placed through order-service.
+
+    ``payment_idempotency_key`` is the server-issued token the next payment attempt must
+    send as ``Idempotency-Key``; it is rotated only once the attempt made with it failed.
+    """
+
+    __tablename__ = "orders"
+    __table_args__ = (
+        CheckConstraint("amount_minor > 0", name="amount_minor"),
+        CheckConstraint("length(currency) = 3", name="currency"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True)  # same id as order-service
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    amount_minor: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    currency: Mapped[str] = mapped_column(Text, nullable=False)
+    available_payment_methods: Mapped[list[str]] = mapped_column(JSONPayload, nullable=False)
+    payment_idempotency_key: Mapped[str | None] = mapped_column(Text, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise in the shape of the OpenAPI ``Order`` schema."""
+        return {
+            "id": str(self.id),
+            "summary": self.summary,
+            "amount_minor": self.amount_minor,
+            "currency": self.currency,
+            "available_payment_methods": list(self.available_payment_methods),
+            "payment_idempotency_key": self.payment_idempotency_key,
+            "created_at": _iso_utc(self.created_at),
+        }
+
+
 class Payment(Base):
     """ENT-001: one attempt to pay for an order, from initiation to confirmed outcome."""
 
@@ -72,22 +107,23 @@ class Payment(Base):
     __table_args__ = (
         CheckConstraint(_in_list("status", PaymentStatus), name="status"),
         CheckConstraint(_in_list("payment_method", PaymentMethod), name="payment_method"),
-        CheckConstraint("amount > 0", name="amount"),
+        CheckConstraint("amount_minor > 0", name="amount_minor"),
         CheckConstraint("length(currency) = 3", name="currency"),
         Index("ix_payments_order_id", "order_id"),
-        Index("ix_payments_gateway_reference", "gateway_reference"),
+        Index("ix_payments_gateway_session_id", "gateway_session_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
-    # Order is owned by the external order-service, so there is no FK to an orders table.
-    order_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+    # References the local order projection (see Order); order-service stays the owner.
+    order_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("orders.id"), nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False, default=PaymentStatus.INITIATED.value)
     payment_method: Mapped[str] = mapped_column(Text, nullable=False)
-    amount: Mapped[int] = mapped_column(BigInteger, nullable=False)  # minor units
+    amount_minor: Mapped[int] = mapped_column(BigInteger, nullable=False)  # copied from the order
     currency: Mapped[str] = mapped_column(Text, nullable=False)  # ISO 4217
     idempotency_key: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
-    checkout_url: Mapped[str | None] = mapped_column(Text)
-    gateway_reference: Mapped[str | None] = mapped_column(Text)
+    # Nullable because a payment whose gateway initiation was refused is kept as failed.
+    gateway_checkout_url: Mapped[str | None] = mapped_column(Text)
+    gateway_session_id: Mapped[str | None] = mapped_column(Text)
     failure_reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -101,11 +137,11 @@ class Payment(Base):
             "order_id": str(self.order_id),
             "status": self.status,
             "payment_method": self.payment_method,
-            "amount": self.amount,
+            "amount_minor": self.amount_minor,
             "currency": self.currency,
             "idempotency_key": self.idempotency_key,
-            "checkout_url": self.checkout_url,
-            "gateway_reference": self.gateway_reference,
+            "gateway_session_id": self.gateway_session_id,
+            "gateway_checkout_url": self.gateway_checkout_url,
             "failure_reason": self.failure_reason,
             "created_at": _iso_utc(self.created_at),
             "updated_at": _iso_utc(self.updated_at),
