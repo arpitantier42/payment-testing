@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pay for your order</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="card">
+    <h1>Pay for your order</h1>
+
+    <section aria-labelledby="order-heading">
+      <h2 id="order-heading">Order summary</h2>
+      <p id="order-summary" data-testid="order-summary">Loading order…</p>
+      <p class="amount">Amount payable: <strong id="order-amount" data-testid="order-amount">—</strong></p>
+    </section>
+
+    <form id="pay-form" novalidate>
+      <fieldset>
+        <legend>Payment method</legend>
+        <div id="methods"></div>
+      </fieldset>
+      <button id="pay-now" type="submit" data-testid="pay-now">Pay Now</button>
+    </form>
+
+    <div id="message" role="alert" aria-live="polite" hidden></div>
+  </main>
+  <script type="module" src="js/pay-page.js"></script>
+</body>
+</html>

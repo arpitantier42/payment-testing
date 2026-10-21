@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Payment result</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="card">
+    <h1>Payment result</h1>
+    <div id="result" role="status" aria-live="polite" data-testid="result-loading">Confirming your payment…</div>
+    <p id="note" class="note" hidden></p>
+    <p class="actions">
+      <button id="check-again" type="button" hidden>Check again</button>
+      <a id="retry" href="#" hidden>Try paying again</a>
+    </p>
+  </main>
+  <script type="module" src="js/result-page.js"></script>
+</body>
+</html>
