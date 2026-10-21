@@ -225,6 +225,12 @@ export function createPayNowController({
         });
         return { sent: true, payment };
       }
+      if (payment.status === "success") {
+        // A replayed key of an attempt that already succeeded (e.g. a new tab): show the
+        // confirmed result and keep Pay Now locked instead of sending the customer to pay again.
+        await confirmReturn(payment.id);
+        return { sent: true, payment };
+      }
       // Stay "in flight": the page is leaving for the gateway checkout. If the page is
       // still here after the timeout (checkout blocked, abandoned, or the tab restored),
       // fall back to the confirmed status instead of spinning indefinitely (HLD NFR-006).

@@ -35,6 +35,8 @@ web/public/                    index.html (pay page), result.html (confirmed res
 web/tests/                     node --test unit tests for js/payment.js
 dev/orders.json                demo order for the order-service stub
 tests/                         conftest.py (migrated DB per test), test_*.py
+tests/e2e/pay_flow.test.mjs    node --test: payment.js against a live server (run by test_e2e_payment_flow.py)
+docs/acceptance/WI-<n>.md      acceptance criterion → code → tests map, per ticket
 docker-compose.yml, Dockerfile Postgres, migration runner, API (healthcheck on /healthz)
 .github/workflows/ci.yml       secret scan, pytest on SQLite and Postgres, docker build
 Makefile                       install / test / test-web / scan-web / dev-token / run / migrate / db-up / test-pg
@@ -132,5 +134,11 @@ Makefile                       install / test / test-web / scan-web / dev-token 
 - Frontend auth: the page is opened as `/pay/?orderId=...#token=...`; `readAccessToken` moves the token into
   sessionStorage (`payment:access-token`), the page strips the fragment, and `createApi(..., {getToken})` sends
   `Authorization: Bearer`. The token is the customer's session, never a gateway credential.
+- End-to-end acceptance: `tests/test_e2e_payment_flow.py` starts the app with uvicorn on a free port (auth on,
+  FakeGateway, one order per scenario), runs `tests/e2e/pay_flow.test.mjs` (real `payment.js`, real HTTP, signs
+  webhooks as the gateway; kept outside `web/` because it holds the webhook secret), then checks DB invariants.
+  Name each Node test after the criteria it proves (`AC5, AC9: ...`) and keep `docs/acceptance/WI-<n>.md` in step.
+- A replayed POST that returns an already-`success` payment is shown as confirmed success (Pay Now locked), never
+  redirected to the gateway again.
 - Not built yet: the real token issuer (order placement), real order-service/gateway adapters,
   fallback gateway status polling.

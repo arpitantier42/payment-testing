@@ -246,6 +246,20 @@ describe("duplicate submissions (AC7, AC8)", () => {
     assert.equal(controller.isInFlight(), true);
   });
 
+  it("a replay that returns an already-successful payment shows success and never redirects", async () => {
+    const { controller, calls, views, navigations } = setup((url, opts) =>
+      opts.method === "POST"
+        ? jsonResponse(200, { id: PAYMENT_ID, order_id: ORDER.id, status: "success", gateway_checkout_url: "https://gateway.example/x" })
+        : jsonResponse(200, { id: PAYMENT_ID, status: "success" }),
+    );
+    await controller.payNow({ order: ORDER, paymentMethod: "upi" });
+    assert.deepEqual(navigations, []);
+    assert.equal(views.at(-1).kind, "confirmed");
+    assert.equal(views.at(-1).result.kind, "success");
+    assert.equal(calls.at(-1).url, `/api/v1/payments/${PAYMENT_ID}`); // confirmed via GET
+    assert.equal(controller.isInFlight(), true);
+  });
+
   it("unlocks after an error so the customer can retry", async () => {
     const { controller, calls } = setup((u, o, n) => (n === 1 ? jsonResponse(500, {}) : created()));
     await controller.payNow({ order: ORDER, paymentMethod: "upi" });
