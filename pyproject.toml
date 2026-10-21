@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "payment-service"
+version = "0.1.0"
+description = "Payment Service: payment records, idempotent initiation and gateway webhook log"
+requires-python = ">=3.11"
+dependencies = [
+    "SQLAlchemy>=2.0",
+    "alembic>=1.13",
+    "psycopg[binary]>=3.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+payment_service = ["db/migrations/*.ini", "db/migrations/*.mako", "db/migrations/versions/*.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
