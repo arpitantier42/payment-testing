@@ -29,14 +29,16 @@ src/payment_service/
   db/session.py                make_engine / make_sessionmaker (SQLite tweaks for tests)
   db/repository.py             data-access functions + domain errors
   db/migrations/               Alembic env + versions/NNNN_description.py
-  integrations/orders.py       OrderService protocol + InMemoryOrderService stub (reads dev/orders.json)
+  integrations/orders.py       OrderService protocol, parse_order_payload (wire shape), HttpOrderService
+                               (assumed contract), InMemoryOrderService stub (dev/orders.json), probe CLI
   integrations/gateway.py      PaymentGateway protocol + FakeGateway stub, HMAC sign/verify
 web/public/                    index.html (pay page), result.html (confirmed result), js/, styles.css
 web/tests/                     node --test unit tests for js/payment.js
 dev/orders.json                demo order for the order-service stub
 tests/                         conftest.py (migrated DB per test), test_*.py
 tests/e2e/pay_flow.test.mjs    node --test: payment.js against a live server (run by test_e2e_payment_flow.py)
-docs/acceptance/WI-<n>.md      acceptance criterion → code → tests map, per ticket
+docs/acceptance/WI-<n>.md      acceptance criterion → code → tests map, per ticket (WI-002.md = spike, ≠ WI-2.md)
+docs/spikes/order-service-contract.md  assumed order-service contract, error mapping, open questions
 docker-compose.yml, Dockerfile Postgres, migration runner, API (healthcheck on /healthz)
 .github/workflows/ci.yml       secret scan, pytest on SQLite and Postgres, docker build
 Makefile                       install / test / test-web / scan-web / dev-token / run / migrate / db-up / test-pg
@@ -51,6 +53,9 @@ Makefile                       install / test / test-web / scan-web / dev-token 
   `http://localhost:8000/pay/?orderId=6f1c2b8e-3d4a-4c5b-9e7f-112233445566`.
 - Postgres via Docker: `docker compose up api` (starts db, runs migrations, serves on :8000); token:
   `docker compose exec api python -m payment_service.auth --order-id <uuid>`.
+- Real order-service: set `ORDER_SERVICE_URL` (+ `ORDER_SERVICE_TIMEOUT_SECONDS`, default 3, and optional
+  `ORDER_SERVICE_API_TOKEN`); unset → dev stub. Check a live order-service against the assumed contract:
+  `ORDER_SERVICE_URL=... .venv/bin/python -m payment_service.integrations.orders <order-uuid>`.
 - Secret scan of the page: `make scan-web` (also in CI and `tests/test_secret_scan.py`).
 - Tests on Postgres: `make test-pg` (uses the `payment_test` database created by compose).
 - New migration: `.venv/bin/alembic revision -m "..."`, then rename the file to `NNNN_description.py`
@@ -119,6 +124,12 @@ Makefile                       install / test / test-web / scan-web / dev-token 
 - order-service and gateway are external: code against the `OrderService` / `PaymentGateway`
   protocols; the in-repo implementations are dev stubs. `orders` is a local projection of
   order-service data (assumed immutable once placed, HLD RSK-002); `payments.order_id` → `orders.id` FK.
+  order-service contract (WI-002 spike, `docs/spikes/order-service-contract.md`, still unconfirmed):
+  `GET {ORDER_SERVICE_URL}/orders/{id}` → 200 `{id, summary, amount|amount_minor (int minor units), currency,
+  created_at (with offset), available_payment_methods?}` / 404 → `None` (getOrder 404) / anything else, timeout,
+  connection error → `OrderServiceError`; a 200 outside the shape → `OrderPayloadError` (subclass) — both getOrder
+  502, nothing cached. Only `parse_order_payload` knows the wire shape; change it there if the real contract
+  differs. Tests: `tests/test_order_service_contract.py` (`FakeOrderServer` plays order-service over HTTP).
   `payments.gateway_session_id`/`gateway_checkout_url` stay nullable because a gateway-refused attempt is
   kept as a failed row (the data model's NOT NULL / "gateway before write" is not adopted yet).
 - Secrets only via environment variables (server side); `.env` is git-ignored, `.env.example` is
@@ -140,5 +151,6 @@ Makefile                       install / test / test-web / scan-web / dev-token 
   Name each Node test after the criteria it proves (`AC5, AC9: ...`) and keep `docs/acceptance/WI-<n>.md` in step.
 - A replayed POST that returns an already-`success` payment is shown as confirmed success (Pay Now locked), never
   redirected to the gateway again.
-- Not built yet: the real token issuer (order placement), real order-service/gateway adapters,
+- Not built yet: the real token issuer (order placement), confirmation of the order-service contract with its
+  owners (adapter exists for the assumed one), real gateway adapter,
   fallback gateway status polling.

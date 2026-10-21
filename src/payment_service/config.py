@@ -45,6 +45,16 @@ def _env_int(name: str, default: int) -> int:
         raise ConfigError(f"{name} must be an integer") from exc
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a number") from exc
+
+
 @dataclass(frozen=True)
 class Settings:
     database_url: str = field(default_factory=database_url, repr=False)
@@ -62,6 +72,12 @@ class Settings:
     auth_disabled: bool = False
     # Lifetime of tokens minted by the dev issuer (`python -m payment_service.auth`).
     auth_token_ttl_seconds: int = 3600
+    # Base URL of the real order-service (e.g. http://orders:8080/api/v1). Empty → dev stub.
+    order_service_url: str = ""
+    # Timeout for one order-service call; exceeding it is a 502 on getOrder.
+    order_service_timeout_seconds: float = 3.0
+    # Optional service-to-service bearer token for order-service.
+    order_service_api_token: str = field(default="", repr=False)
     # JSON file with the dev order-service stub's orders.
     orders_file: Path = REPO_ROOT / "dev" / "orders.json"
     # Static payment page served at /pay/.
@@ -79,6 +95,11 @@ class Settings:
             auth_token_secret=env.get("AUTH_TOKEN_SECRET", ""),
             auth_disabled=_env_flag("AUTH_DISABLED"),
             auth_token_ttl_seconds=_env_int("AUTH_TOKEN_TTL_SECONDS", cls.auth_token_ttl_seconds),
+            order_service_url=env.get("ORDER_SERVICE_URL", "").strip().rstrip("/"),
+            order_service_timeout_seconds=_env_float(
+                "ORDER_SERVICE_TIMEOUT_SECONDS", cls.order_service_timeout_seconds
+            ),
+            order_service_api_token=env.get("ORDER_SERVICE_API_TOKEN", ""),
             orders_file=Path(env.get("ORDERS_FILE", str(cls.orders_file))),
             web_dir=Path(env.get("WEB_DIR", str(cls.web_dir))),
         )
@@ -95,6 +116,10 @@ class Settings:
                 problems.append(f"AUTH_TOKEN_SECRET must be at least {MIN_AUTH_SECRET_LENGTH} characters")
         if self.auth_token_ttl_seconds <= 0:
             problems.append("AUTH_TOKEN_TTL_SECONDS must be positive")
+        if self.order_service_timeout_seconds <= 0:
+            problems.append("ORDER_SERVICE_TIMEOUT_SECONDS must be positive")
+        if self.order_service_url and not self.order_service_url.startswith(("http://", "https://")):
+            problems.append("ORDER_SERVICE_URL must be an http(s) URL")
         if problems:
             raise ConfigError("Invalid configuration: " + "; ".join(problems))
         return self
