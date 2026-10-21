@@ -12,6 +12,8 @@ import {
   availableMethods,
   createPayNowController,
   formatAmount,
+  minorToDecimal,
+  orderView,
   paymentIdStorageKey,
   pollConfirmedStatus,
   resolvePaymentId,
@@ -127,9 +129,77 @@ describe("order display (AC1, AC2, AC3, AC7, AC8)", () => {
     assert.equal(formatAmount(undefined, "INR"), null);
   });
 
+  it("an order without a summary is reported, never shown blank", () => {
+    assert.match(validateOrder({ ...ORDER, summary: "  " }).join(" "), /summary is missing/);
+    assert.match(validateOrder({ ...ORDER, summary: undefined }).join(" "), /summary is missing/);
+  });
+
   it("offers UPI, card and net banking as distinct methods, filtered by the order", () => {
     assert.deepEqual(availableMethods(ORDER).map((m) => m.value), ["upi", "card", "netbanking"]);
     assert.deepEqual(availableMethods({ ...ORDER, available_payment_methods: ["card"] }).map((m) => m.value), ["card"]);
+  });
+});
+
+describe("WI-003 order section (getOrder → what the page shows)", () => {
+  it("AC1: a missing or malformed order id shows an error, not a blank order field", () => {
+    for (const id of [undefined, null, "", "not-a-uuid"]) {
+      const view = orderView({ order: { ...ORDER, id } });
+      assert.equal(view.ok, false);
+      assert.match(view.message, /order ID is missing/);
+      assert.equal(view.orderId, undefined);
+    }
+  });
+
+  it("AC2: without a currency no amount is shown at all", () => {
+    for (const currency of [undefined, null, "", "₹", "RUPEES"]) {
+      const view = orderView({ order: { ...ORDER, currency } });
+      assert.equal(view.ok, false);
+      assert.match(view.message, /currency is missing/);
+      assert.equal(view.amount, undefined);
+      assert.equal(formatAmount(ORDER.amount_minor, currency), null);
+    }
+  });
+
+  it("AC3: a failed getOrder shows an error and no amount (404, 502, timeout, 401)", () => {
+    const cases = [
+      [new ApiError(404, "order_not_found", "Order not found"), /couldn't find this order/],
+      [new ApiError(502, "order_service_unavailable", "Order details are unavailable right now"), /couldn't load your order/],
+      [new NetworkError(new Error("no response within 15000 ms")), /couldn't load your order/],
+      [new ApiError(401, "unauthorized", "x"), /session has expired/],
+    ];
+    for (const [error, message] of cases) {
+      // Even if a previous order object is around, an error never falls back to it.
+      const view = orderView({ order: ORDER, error });
+      assert.equal(view.ok, false);
+      assert.match(view.message, message);
+      assert.equal(view.amount, undefined);
+    }
+    assert.equal(orderView({ order: null }).ok, false);
+    assert.equal(orderView({ order: { ...ORDER, amount_minor: 3499.5 } }).ok, false);
+    assert.equal(orderView({ order: { ...ORDER, amount_minor: "349900" } }).ok, false);
+  });
+
+  it("AC4: renders the backend's exact amount, placed by the currency's own exponent", () => {
+    const view = orderView({ order: ORDER });
+    assert.equal(view.ok, true);
+    assert.equal(view.orderId, ORDER.id);
+    assert.equal(view.summary, ORDER.summary);
+    assert.equal(view.amount, formatAmount(349900, "INR"));
+    assert.match(view.amount, /3,?499\.00/);
+    // Zero- and three-decimal currencies are not divided by 100.
+    assert.match(formatAmount(1500, "JPY"), /1,?500(?![.\d])/);
+    assert.match(formatAmount(1234, "KWD"), /1\.234/);
+    // No float rounding: one minor unit is visible, large amounts are kept digit for digit.
+    assert.match(formatAmount(1, "INR"), /0\.01/);
+    assert.match(formatAmount(900719925474099, "INR"), /9,?007,?199,?254,?740\.99/);
+  });
+
+  it("minorToDecimal places the decimal point without arithmetic", () => {
+    assert.equal(minorToDecimal(349900, 2), "3499.00");
+    assert.equal(minorToDecimal(5, 2), "0.05");
+    assert.equal(minorToDecimal(1500, 0), "1500");
+    assert.equal(minorToDecimal(1234, 3), "1.234");
+    assert.equal(minorToDecimal(-5, 2), "-0.05");
   });
 });
 

@@ -15,6 +15,7 @@ import {
   createApi,
   createPayNowController,
   formatAmount,
+  orderView,
   pollConfirmedStatus,
   readAccessToken,
   resolvePaymentId,
@@ -303,5 +304,53 @@ describe("WI-2 acceptance against a live payment-service", () => {
       [...tab.storage.map.keys()].sort(),
       [ACCESS_TOKEN_STORAGE_KEY, `payment:id:${order.id}`].sort(),
     );
+  });
+});
+
+/** What pay-page.js's loadOrder does: getOrder, then orderView decides what is shown. */
+async function loadOrderSection(tab, orderId) {
+  try {
+    return orderView({ order: await tab.api.getOrder(orderId) });
+  } catch (error) {
+    return orderView({ error });
+  }
+}
+
+describe("WI-003 acceptance: getOrder → order section, against a live payment-service", () => {
+  it("AC1, AC2: the backend's order id, summary and currency-tagged amount are shown, incomplete orders are errors", async () => {
+    const tab = openPayPage();
+    const order = await tab.api.getOrder(ORDERS.orderView);
+    const view = orderView({ order });
+    assert.equal(view.ok, true);
+    assert.equal(view.orderId, ORDERS.orderView);
+    assert.equal(view.summary, "Order for orderView");
+    assert.match(view.amount, /3,?499\.00/);
+    assert.notEqual(view.amount.replace(/[\d.,\s]/g, ""), "", "amount carries a currency indicator");
+    // The same response with the id or the currency missing is an error, not a blank/bare field.
+    assert.match(orderView({ order: { ...order, id: undefined } }).message, /order ID is missing/);
+    const noCurrency = orderView({ order: { ...order, currency: undefined } });
+    assert.equal(noCurrency.ok, false);
+    assert.equal(noCurrency.amount, undefined);
+  });
+
+  it("AC3: order-service failure (502), unknown order (404) and a foreign order show an error and no amount", async () => {
+    for (const [tab, orderId, message] of [
+      [openPayPage(), ORDERS.broken, /couldn't load your order/],
+      [openPayPage(), ORDERS.unknown, /couldn't find this order/],
+      [openPayPage({ token: OTHER_ORDER_TOKEN }), ORDERS.orderView, /couldn't find this order/],
+      [openPayPage({ token: null }), ORDERS.orderView, /session has expired/],
+    ]) {
+      const view = await loadOrderSection(tab, orderId);
+      assert.equal(view.ok, false);
+      assert.match(view.message, message);
+      assert.equal(view.amount, undefined);
+    }
+  });
+
+  it("AC4: the exact backend amount is rendered, in the currency's own minor units", async () => {
+    const view = await loadOrderSection(openPayPage(), ORDERS.orderViewJpy);
+    assert.equal(view.ok, true);
+    assert.equal(view.amount, formatAmount(1500, "JPY"));
+    assert.match(view.amount, /1,?500(?![.\d])/); // not ¥15.00
   });
 });

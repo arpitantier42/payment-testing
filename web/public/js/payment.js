@@ -34,13 +34,29 @@ export function isUuid(value) {
 
 const CURRENCY_RE = /^[A-Z]{3}$/i;
 
-/** Format minor units with their currency; returns null when either is missing (never a bare number). */
+/** Exact decimal string for `amount` minor units with `digits` fraction digits (no float arithmetic). */
+export function minorToDecimal(amount, digits) {
+  const negative = amount < 0;
+  const units = String(Math.abs(amount)).padStart(digits + 1, "0");
+  const whole = units.slice(0, units.length - digits);
+  const fraction = digits > 0 ? `.${units.slice(units.length - digits)}` : "";
+  return `${negative ? "-" : ""}${whole}${fraction}`;
+}
+
+/**
+ * Format the backend's minor units with their currency; returns null when either is missing
+ * (never a bare number). The value is the backend's exactly: the decimal point is placed by the
+ * currency's own minor-unit exponent (JPY 0, INR 2, KWD 3), never rounded or recomputed.
+ */
 export function formatAmount(amount, currency) {
-  if (!Number.isInteger(amount) || typeof currency !== "string" || !CURRENCY_RE.test(currency)) return null;
+  if (!Number.isSafeInteger(amount) || typeof currency !== "string" || !CURRENCY_RE.test(currency)) return null;
+  const code = currency.toUpperCase();
   try {
-    return new Intl.NumberFormat(undefined, { style: "currency", currency }).format(amount / 100);
+    const format = new Intl.NumberFormat(undefined, { style: "currency", currency: code });
+    const digits = format.resolvedOptions().maximumFractionDigits;
+    return format.format(minorToDecimal(amount, digits));
   } catch {
-    return `${(amount / 100).toFixed(2)} ${currency}`;
+    return `${minorToDecimal(amount, 2)} ${code}`;
   }
 }
 
@@ -107,9 +123,34 @@ export function createApi(fetchImpl, baseUrl = "", { timeoutMs = REQUEST_TIMEOUT
 export function validateOrder(order) {
   const errors = [];
   if (!order || !isUuid(order.id)) errors.push("The order ID is missing.");
-  if (!order || !Number.isInteger(order.amount_minor) || order.amount_minor <= 0) errors.push("The payable amount is missing.");
+  if (!order || typeof order.summary !== "string" || !order.summary.trim()) errors.push("The order summary is missing.");
+  if (!order || !Number.isSafeInteger(order.amount_minor) || order.amount_minor <= 0) errors.push("The payable amount is missing.");
   if (!order || typeof order.currency !== "string" || !CURRENCY_RE.test(order.currency)) errors.push("The currency is missing.");
   return errors;
+}
+
+/**
+ * What the order section shows, decided from the getOrder outcome alone (WI-003):
+ * `{ ok: true, orderId, summary, amount }` with every field taken verbatim from the backend's
+ * order, or `{ ok: false, message }` when the order failed to load or is incomplete; the page then
+ * clears every field, so it never shows a blank id, a bare number or a stale amount.
+ */
+export function orderView({ order = null, error = null } = {}) {
+  if (error) {
+    const message =
+      error.status === 404
+        ? "We couldn't find this order."
+        : error.status === 401
+          ? apiErrorMessage(error)
+          : "We couldn't load your order. Please try again.";
+    return { ok: false, message };
+  }
+  const problems = validateOrder(order);
+  const amount = problems.length ? null : formatAmount(order.amount_minor, order.currency);
+  if (problems.length || amount === null) {
+    return { ok: false, message: `${(problems.length ? problems : ["The payable amount is missing."]).join(" ")} Please try again later.` };
+  }
+  return { ok: true, orderId: order.id, summary: order.summary, amount };
 }
 
 /** Methods the backend allows for this order (all three when it does not say). */

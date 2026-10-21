@@ -149,6 +149,25 @@ def test_get_unknown_order_is_404(client, order_id):
 def test_order_service_failure_is_502(make_client):
     r = make_client(order_service=BrokenOrderService()).get(f"/api/v1/orders/{ORDER.id}")
     assert r.status_code == 502
+    assert r.json()["error"]["code"] == "order_service_unavailable"
+
+
+def test_order_service_failure_caches_nothing_and_later_succeeds(make_client, session_factory):
+    """WI-003 AC3: a failed fetch leaves no partial projection, so no stale amount can be served."""
+    from payment_service.db.models import Order as OrderProjection
+
+    assert make_client(order_service=BrokenOrderService()).get(f"/api/v1/orders/{ORDER.id}").status_code == 502
+    assert _count(session_factory, OrderProjection) == 0
+    r = make_client().get(f"/api/v1/orders/{ORDER.id}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == str(ORDER.id) and body["amount_minor"] == ORDER.amount_minor and body["currency"] == "INR"
+
+
+def test_get_order_requires_bearer_token(make_client):
+    r = make_client(token=None).get(f"/api/v1/orders/{ORDER.id}")
+    assert r.status_code == 401
+    assert r.headers["WWW-Authenticate"].startswith("Bearer")
 
 
 # --- POST /api/v1/payments (REQ-008, REQ-015) ----------------------------------------

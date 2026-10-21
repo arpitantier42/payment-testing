@@ -66,7 +66,7 @@ Makefile                       install / test / test-web / scan-web / dev-token 
   `WWW-Authenticate: Bearer`. A token scoped to an order (`order_id` claim) gets 404 for any other order and
   its payments. Webhook and `/healthz` take no bearer token.
 - `GET /api/v1/orders/{orderId}` → 200 Order `{id, summary, amount_minor, currency, available_payment_methods,
-  payment_idempotency_key, created_at}` | 404 | 502 (order-service failure and no cached projection).
+  payment_idempotency_key, created_at}` | 404 | 502 (order-service failure and no cached projection; nothing cached).
   Projects the order into `orders` on first sight (cache; never overwritten) and issues/rotates the key.
 - `POST /api/v1/payments` (header `Idempotency-Key` = the order's `payment_idempotency_key`, body
   `order_id, payment_method, amount_minor?, currency?`) → 201 new Payment | 200 replay of the key |
@@ -111,8 +111,12 @@ Makefile                       install / test / test-web / scan-web / dev-token 
   paymentId stored in sessionStorage from the initiation response. Pay Now is guarded by a
   synchronous in-flight flag + disabled button; the Idempotency-Key is the order's
   `payment_idempotency_key` (never generated client-side); after an answered error/failed attempt the page
-  reloads the order to get the rotated key. An order missing id/amount/currency (`validateOrder`) or an
-  invalid `orderId` disables Pay Now and shows an error. Methods shown = `available_payment_methods`.
+  reloads the order to get the rotated key. An order missing id/summary/amount/currency (`validateOrder`) or an
+  invalid `orderId` disables Pay Now and shows an error. What the order section shows is decided by DOM-free
+  `orderView({order, error})` (WI-003): either all fields verbatim from getOrder or an error with every field
+  cleared (never a stale amount). Amounts are shown only via `formatAmount(amount_minor, currency)`, which places
+  the decimal point by the currency's exponent (`Intl` `maximumFractionDigits`: JPY 0, INR 2, KWD 3) through
+  `minorToDecimal` (string, no float division) and returns null without a valid currency — never `amount / 100`. Methods shown = `available_payment_methods`.
   Distinct views/test ids for validation, network error, API error, failed, pending, success.
 - Never hang (REQ-009 AC2): `createApi` aborts requests after `REQUEST_TIMEOUT_MS` (→ NetworkError);
   after hand-off the Pay Now controller arms a `CHECKOUT_TIMEOUT_MS` timer (injectable `setTimer`) that

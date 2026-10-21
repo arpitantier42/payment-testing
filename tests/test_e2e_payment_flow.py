@@ -31,8 +31,10 @@ from tests.test_api import AUTH_SECRET, SECRET
 E2E_SCRIPT = REPO_ROOT / "tests" / "e2e" / "pay_flow.test.mjs"
 ORDER_NAMES = (
     "display", "validation", "apiError", "redirect", "abandon",
-    "confirm", "foreign", "doubleClick", "retry", "secrets",
+    "confirm", "foreign", "doubleClick", "retry", "secrets", "orderView", "orderViewJpy",
 )  # fmt: skip
+# Scenarios whose order is not the default 349900 INR (WI-003 AC4: zero-decimal currency).
+ORDER_AMOUNTS = {"orderViewJpy": (1500, "JPY")}
 
 
 class E2EOrderService:
@@ -44,8 +46,8 @@ class E2EOrderService:
             oid: Order(
                 id=oid,
                 summary=f"Order for {name}",
-                amount_minor=349900,
-                currency="INR",
+                amount_minor=ORDER_AMOUNTS.get(name, (349900, "INR"))[0],
+                currency=ORDER_AMOUNTS.get(name, (349900, "INR"))[1],
                 created_at=datetime(2026, 10, 21, tzinfo=timezone.utc),
             )
             for name, oid in order_ids.items()
