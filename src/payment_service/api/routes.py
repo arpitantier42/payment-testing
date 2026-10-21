@@ -124,6 +124,13 @@ class CreatePaymentRequest(BaseModel):
     currency: str | None = None
 
 
+def _differs(body: CreatePaymentRequest, amount_minor: int, currency: str) -> bool:
+    """True when the client sent an amount or currency other than the given one."""
+    return (body.amount_minor is not None and body.amount_minor != amount_minor) or (
+        body.currency is not None and body.currency.upper() != currency
+    )
+
+
 def _payment_response(payment: Payment, status_code: int = 200) -> JSONResponse:
     return JSONResponse(payment.to_dict(), status_code=status_code)
 
@@ -135,6 +142,7 @@ def create_payment(
     principal: PrincipalDep,
     settings: Annotated[Settings, Depends(get_settings)],
     gateway: Annotated[PaymentGateway, Depends(get_gateway)],
+    orders: Annotated[OrderService, Depends(get_order_service)],
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> JSONResponse:
     try:
@@ -148,17 +156,21 @@ def create_payment(
     # A replay of the same attempt returns the original payment without new side effects.
     existing = repo.get_payment_by_idempotency_key(session, idempotency_key)
     if existing is not None:
-        if existing.order_id != order_id:
+        if existing.order_id != order_id or _differs(body, existing.amount_minor, existing.currency):
             raise ApiError(409, "idempotency_conflict", "Idempotency-Key was already used for a different payment")
         return _payment_response(existing, 200)
 
     order = repo.get_order(session, order_id)
     if order is None:
         raise ApiError(404, "order_not_found", "Order not found")
-    if (body.amount_minor is not None and body.amount_minor != order.amount_minor) or (
-        body.currency is not None and body.currency.upper() != order.currency
-    ):
+    if _differs(body, order.amount_minor, order.currency):
         raise ApiError(400, "amount_mismatch", "Amount or currency does not match the order")
+
+    # Step 1 (REQ-006): revalidate against order-service before anything is stored or charged.
+    # The projection is never overwritten (RSK-002), so a changed order is refused, not followed.
+    current = _fetch_order(orders, order_id)
+    if current.amount_minor != order.amount_minor or current.currency.upper() != order.currency:
+        raise ApiError(409, "order_changed", "The order amount has changed; please contact support")
 
     try:
         payment, created = repo.create_payment(
@@ -186,10 +198,10 @@ def create_payment(
             payment_method=payment.payment_method,
             return_url=return_url,
         )
-    except GatewayError as exc:
-        repo.update_payment_status(
-            session, payment, PaymentStatus.FAILED, failure_reason=f"Gateway rejected initiation: {exc}"
-        )
+    except Exception as exc:  # GatewayError, or a transport failure in a real adapter
+        # Never leave the attempt `initiated`: a failed row frees the order for a retry with a new key.
+        reason = f"Gateway rejected initiation: {exc}" if isinstance(exc, GatewayError) else "Gateway did not respond"
+        repo.update_payment_status(session, payment, PaymentStatus.FAILED, failure_reason=reason)
         session.commit()
         raise ApiError(502, "gateway_error", "The payment gateway could not start this payment") from exc
 

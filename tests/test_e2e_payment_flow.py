@@ -32,6 +32,7 @@ E2E_SCRIPT = REPO_ROOT / "tests" / "e2e" / "pay_flow.test.mjs"
 ORDER_NAMES = (
     "display", "validation", "apiError", "redirect", "abandon",
     "confirm", "foreign", "doubleClick", "retry", "secrets", "orderView", "orderViewJpy",
+    "wi004Method", "wi004Errors", "wi004Conflict", "wi004Double",
 )  # fmt: skip
 # Scenarios whose order is not the default 349900 INR (WI-003 AC4: zero-decimal currency).
 ORDER_AMOUNTS = {"orderViewJpy": (1500, "JPY")}
@@ -143,3 +144,10 @@ def test_payment_page_flow_against_live_service(live_server, session_factory):
     assert len(live_server["gateway"].calls) == len(payments)
     # AC10: rejected initiations (bad key, other customer, no session) stored nothing.
     assert per_order[order_ids["apiError"]] == 0
+    # WI-004: the method stored is the one selected; rejected (400/409) attempts stored nothing;
+    # a double click stored one payment.
+    by_order = {p.order_id: p for p in payments}
+    assert by_order[order_ids["wi004Method"]].payment_method == "netbanking"
+    assert per_order[order_ids["wi004Errors"]] == 0
+    assert per_order[order_ids["wi004Double"]] == 1
+    assert by_order[order_ids["wi004Double"]].payment_method == "card"

@@ -339,6 +339,93 @@ describe("duplicate submissions (AC7, AC8)", () => {
   });
 });
 
+describe("WI-004 Pay Now → POST /api/v1/payments", () => {
+  const sentMethod = (call) => JSON.parse(call.options.body).payment_method;
+
+  it("AC1: Pay Now without a selected method is a validation message and no request", async () => {
+    for (const paymentMethod of [null, undefined, ""]) {
+      const { controller, calls, views } = setup(() => created());
+      assert.equal((await controller.payNow({ order: ORDER, paymentMethod })).sent, false);
+      assert.equal(calls.length, 0);
+      assert.equal(views.at(-1).kind, "validation");
+      assert.match(views.at(-1).messages.join(" "), /payment method/i);
+      assert.equal(controller.isInFlight(), false); // still clickable once a method is chosen
+    }
+  });
+
+  it("AC2, AC7: with a method selected Pay Now makes exactly one REST POST /api/v1/payments", async () => {
+    const { controller, calls } = setup(() => created());
+    await controller.payNow({ order: ORDER, paymentMethod: "card" });
+    assert.deepEqual(calls.map((c) => [c.options.method, c.url]), [["POST", "/api/v1/payments"]]);
+    assert.equal(calls[0].options.headers["Content-Type"], "application/json");
+  });
+
+  it("AC3: the selected method is the one sent", async () => {
+    for (const method of ["upi", "card", "netbanking"]) {
+      const { controller, calls } = setup(() => created());
+      await controller.payNow({ order: ORDER, paymentMethod: method });
+      assert.equal(sentMethod(calls[0]), method);
+    }
+  });
+
+  it("AC4: changing the selection before clicking changes the method submitted", async () => {
+    // First attempt with UPI is answered with an error; the customer switches to card and clicks again.
+    const { controller, calls } = setup((u, o, n) => (n === 1 ? jsonResponse(400, { error: { message: "no" } }) : created()));
+    await controller.payNow({ order: ORDER, paymentMethod: "upi" });
+    await controller.payNow({ order: ORDER, paymentMethod: "card" });
+    assert.deepEqual(calls.map(sentMethod), ["upi", "card"]);
+  });
+
+  it("AC5: missing order id, amount or method sends nothing and shows an error", async () => {
+    for (const input of [
+      { order: { ...ORDER, id: undefined }, paymentMethod: "upi" },
+      { order: { ...ORDER, amount_minor: undefined }, paymentMethod: "upi" },
+      { order: ORDER, paymentMethod: null },
+    ]) {
+      const { controller, calls, views, navigations } = setup(() => created());
+      await controller.payNow(input);
+      assert.equal(calls.length, 0);
+      assert.equal(views.at(-1).kind, "validation");
+      assert.deepEqual(navigations, []);
+    }
+  });
+
+  it("AC6, AC8: every non-success response (400/401/404/409/502) is an error view, never a redirect", async () => {
+    for (const status of [400, 401, 404, 409, 502]) {
+      const { controller, views, navigations } = setup(() =>
+        jsonResponse(status, { error: { code: "x", message: `refused ${status}` } }),
+      );
+      await controller.payNow({ order: ORDER, paymentMethod: "upi" });
+      assert.equal(views.at(-1).kind, "api");
+      assert.equal(views.at(-1).status, status);
+      assert.deepEqual(navigations, []);
+    }
+  });
+
+  it("AC9: a second click while the first is in flight sends nothing, even with another method", async () => {
+    const pending = deferred();
+    const { controller, calls } = setup(() => pending.promise);
+    const first = controller.payNow({ order: ORDER, paymentMethod: "upi" });
+    assert.deepEqual(await controller.payNow({ order: ORDER, paymentMethod: "card" }), { ignored: true });
+    pending.resolve(created());
+    await first;
+    assert.equal(calls.length, 1);
+    assert.equal(sentMethod(calls[0]), "upi");
+  });
+
+  it("AC10: a rapid double click (same tick) sends exactly one request", async () => {
+    const pending = deferred();
+    const { controller, calls, views } = setup(() => pending.promise);
+    const a = controller.payNow({ order: ORDER, paymentMethod: "upi" });
+    const b = controller.payNow({ order: ORDER, paymentMethod: "upi" });
+    assert.equal(calls.length, 1);
+    assert.equal(views.at(-1).submitting, true);
+    pending.resolve(created());
+    await Promise.all([a, b]);
+    assert.equal(calls.length, 1);
+  });
+});
+
 describe("confirmed status from the backend (AC3, AC4, AC5, AC6, AC9)", () => {
   const paymentBody = (status, extra = {}) => jsonResponse(200, { id: PAYMENT_ID, status, ...extra });
 

@@ -71,8 +71,11 @@ Makefile                       install / test / test-web / scan-web / dev-token 
 - `POST /api/v1/payments` (header `Idempotency-Key` = the order's `payment_idempotency_key`, body
   `order_id, payment_method, amount_minor?, currency?`) → 201 new Payment | 200 replay of the key |
   400 missing/invalid/unknown field, method not available, key not issued for the order, or amount/currency ≠ order |
-  404 order never projected | 409 key used for another order | 502 gateway refused (payment stored as failed).
-  Amount/currency are always copied from the projection.
+  404 order never projected or gone at order-service | 409 key used for another order or (replay) another
+  amount/currency, or `order_changed` (order-service now reports another amount/currency than the projection) |
+  502 gateway refused or raised anything (payment stored as failed, never left `initiated`) or order-service down.
+  A new attempt (not a replay) revalidates the order with order-service before the insert (WI-004 step 1);
+  nothing is stored or charged when that fails. Amount/currency are always copied from the projection.
 - Payment JSON: `id, order_id, status, payment_method, amount_minor, currency, idempotency_key,
   gateway_session_id, gateway_checkout_url, failure_reason, created_at, updated_at`.
 - `GET /api/v1/payments/{paymentId}` → 200 Payment | 404 (unknown or malformed id).

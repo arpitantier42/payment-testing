@@ -354,3 +354,60 @@ describe("WI-003 acceptance: getOrder → order section, against a live payment-
     assert.match(view.amount, /1,?500(?![.\d])/); // not ¥15.00
   });
 });
+
+describe("WI-004 acceptance: Pay Now → createPayment, against a live payment-service", () => {
+  it("AC1, AC2, AC3, AC4, AC7: no method is refused locally; the method selected at the click is the one stored", async () => {
+    const tab = openPayPage();
+    const order = await tab.api.getOrder(ORDERS.wi004Method);
+    assert.equal((await tab.controller.payNow({ order, paymentMethod: null })).sent, false);
+    assert.equal(tab.views.at(-1).kind, "validation");
+    assert.equal(posts(tab).length, 0);
+    // pay-page.js reads the checked radio at submit time; here net banking is checked.
+    await tab.controller.payNow({ order, paymentMethod: "netbanking" });
+    assert.equal(posts(tab).length, 1);
+    assert.equal(posts(tab)[0].url, `${BASE_URL}/api/v1/payments`);
+    assert.equal(JSON.parse(posts(tab)[0].body).payment_method, "netbanking");
+    const payment = await tab.api.getPayment(tab.storage.getItem(`payment:id:${order.id}`));
+    assert.equal(payment.payment_method, "netbanking");
+    assert.equal(payment.status, "processing");
+    assert.deepEqual(tab.navigations, [payment.gateway_checkout_url]);
+  });
+
+  it("AC5, AC6, AC8: missing fields send nothing; 400 and 409 answers are error views, never a redirect", async () => {
+    const tab = openPayPage();
+    const order = await tab.api.getOrder(ORDERS.wi004Errors);
+    for (const input of [
+      { order: { ...order, id: undefined }, paymentMethod: "card" },
+      { order: { ...order, amount_minor: undefined }, paymentMethod: "card" },
+    ]) {
+      assert.equal((await tab.controller.payNow(input)).sent, false);
+    }
+    assert.equal(posts(tab).length, 0);
+    // A stale amount on the page -> 400 amount_mismatch.
+    await tab.controller.payNow({ order: { ...order, amount_minor: order.amount_minor + 1 }, paymentMethod: "card" });
+    assert.equal(tab.views.at(-1).kind, "api");
+    assert.equal(tab.views.at(-1).status, 400);
+    // A key already used for another order's payment -> 409.
+    const elsewhere = openPayPage();
+    const other = await elsewhere.api.getOrder(ORDERS.wi004Conflict);
+    await elsewhere.controller.payNow({ order: other, paymentMethod: "upi" });
+    assert.equal(elsewhere.views.at(-1).kind, "redirecting");
+    await tab.controller.payNow({ order: { ...order, payment_idempotency_key: other.payment_idempotency_key }, paymentMethod: "card" });
+    assert.equal(tab.views.at(-1).kind, "api");
+    assert.equal(tab.views.at(-1).status, 409);
+    assert.ok(tab.views.at(-1).message);
+    assert.deepEqual(tab.navigations, []);
+  });
+
+  it("AC9, AC10: a rapid double click, even switching method, sends one request and stores one payment", async () => {
+    const tab = openPayPage();
+    const order = await tab.api.getOrder(ORDERS.wi004Double);
+    const results = await Promise.all([
+      tab.controller.payNow({ order, paymentMethod: "card" }),
+      tab.controller.payNow({ order, paymentMethod: "upi" }),
+    ]);
+    assert.deepEqual(results[1], { ignored: true });
+    assert.equal(posts(tab).length, 1);
+    assert.equal(JSON.parse(posts(tab)[0].body).payment_method, "card");
+  });
+});

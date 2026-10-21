@@ -279,6 +279,114 @@ def test_gateway_rejection_is_502_and_payment_marked_failed(make_client, session
     assert _issued_key(client) != payment.idempotency_key
 
 
+class SwitchableOrderService:
+    """order-service double whose answer can change after the projection was cached."""
+
+    def __init__(self, order):
+        self.order = order
+        self.calls = 0
+
+    def get_order(self, order_id):
+        self.calls += 1
+        if isinstance(self.order, Exception):
+            raise self.order
+        return self.order if self.order and self.order.id == order_id else None
+
+
+def test_create_payment_revalidates_the_order_with_order_service(make_client, gateway):
+    """WI-004 step 1 (REQ-006): order-service is asked again before the insert."""
+    service = SwitchableOrderService(ORDER)
+    client = make_client(order_service=service)
+    key = _issued_key(client)
+    calls_after_get = service.calls
+    assert _create(client, key=key).status_code == 201
+    assert service.calls == calls_after_get + 1
+    # A replay of the same key has no side effects, so it does not ask again.
+    assert _create(client, key=key).status_code == 200
+    assert service.calls == calls_after_get + 1
+
+
+@pytest.mark.parametrize(
+    "upstream, status, code",
+    [
+        (OrderServiceError("timeout"), 502, "order_service_unavailable"),
+        (None, 404, "order_not_found"),
+        (Order(id=ORDER.id, summary="s", amount_minor=1, currency="INR", created_at=ORDER.created_at), 409, "order_changed"),
+        (Order(id=ORDER.id, summary="s", amount_minor=349900, currency="USD", created_at=ORDER.created_at), 409, "order_changed"),
+    ],
+)
+def test_order_revalidation_failure_stores_and_charges_nothing(make_client, gateway, session_factory, upstream, status, code):
+    service = SwitchableOrderService(ORDER)
+    client = make_client(order_service=service)
+    key = _issued_key(client)
+    service.order = upstream  # order-service changes its answer after the page loaded
+    r = _create(client, key=key)
+    assert r.status_code == status
+    assert r.json()["error"]["code"] == code
+    assert gateway.calls == [] and _count(session_factory) == 0
+
+
+def test_replayed_key_with_a_different_amount_is_409(client, gateway, session_factory):
+    key = _issued_key(client)
+    assert _create(client, key=key).status_code == 201
+    r = _create(client, key=key, amount_minor=1)
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "idempotency_conflict"
+    assert len(gateway.calls) == 1 and _count(session_factory) == 1
+
+
+class TimingOutGateway:
+    def __init__(self):
+        self.calls = []
+
+    def create_transaction(self, **kwargs):
+        self.calls.append(kwargs)
+        raise TimeoutError("read timed out")
+
+
+def test_gateway_transport_failure_is_502_and_never_leaves_payment_initiated(make_client, session_factory):
+    client = make_client(gateway=TimingOutGateway())
+    key = _issued_key(client)
+    r = _create(client, key=key)
+    assert r.status_code == 502
+    assert r.json()["error"]["code"] == "gateway_error"
+    with session_factory() as s:
+        payment = s.query(Payment).one()
+        assert payment.status == "failed" and payment.failure_reason
+    assert _issued_key(client) != key  # a retry is possible with a fresh key
+
+
+def test_simultaneous_posts_with_the_same_key_create_one_payment(make_client, gateway, session_factory):
+    """HLD NFR-003: two concurrent POSTs with one Idempotency-Key -> one row, one gateway call."""
+    import threading
+
+    key = _issued_key(make_client())
+    barrier = threading.Barrier(2)
+    statuses = []
+
+    def worker():
+        client = make_client()
+        barrier.wait(timeout=5)
+        try:
+            statuses.append(_create(client, key=key).status_code)
+        except Exception:  # pragma: no cover - SQLite may raise "database is locked"
+            statuses.append(None)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert _count(session_factory) == 1
+    assert len(gateway.calls) == 1
+    assert 201 in statuses
+    # The loser is a replay (200); SQLite, which serialises writers, may instead refuse it.
+    assert all(s in (200, 201, 500, None) for s in statuses)
+    with session_factory() as s:
+        assert s.query(Payment).one().idempotency_key == key
+
+
 # --- GET /api/v1/payments/{paymentId} (REQ-011, REQ-013) --------------------------------
 
 
