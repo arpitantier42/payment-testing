@@ -9,28 +9,25 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
 
+ALL_METHODS = ("upi", "card", "netbanking")
+
+
 @dataclass(frozen=True)
 class Order:
+    """An order as order-service reports it; payment-service stores a projection of it."""
+
     id: uuid.UUID
     summary: str
-    amount: int  # minor units
+    amount_minor: int  # minor units
     currency: str  # ISO 4217
     created_at: datetime
-
-    def to_dict(self) -> dict:
-        return {
-            "id": str(self.id),
-            "summary": self.summary,
-            "amount": self.amount,
-            "currency": self.currency,
-            "created_at": self.created_at.isoformat(),
-        }
+    available_payment_methods: tuple[str, ...] = field(default=ALL_METHODS)
 
 
 class OrderServiceError(Exception):
@@ -61,9 +58,10 @@ class InMemoryOrderService:
                 Order(
                     id=uuid.UUID(o["id"]),
                     summary=o["summary"],
-                    amount=int(o["amount"]),
+                    amount_minor=int(o["amount_minor"]),
                     currency=o["currency"],
                     created_at=datetime.fromisoformat(o["created_at"]),
+                    available_payment_methods=tuple(o.get("available_payment_methods", ALL_METHODS)),
                 )
                 for o in raw
             ]

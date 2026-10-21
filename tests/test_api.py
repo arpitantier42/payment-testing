@@ -15,7 +15,7 @@ SECRET = "test-webhook-secret"
 ORDER = Order(
     id=uuid.UUID("6f1c2b8e-3d4a-4c5b-9e7f-112233445566"),
     summary="2 x T-shirt",
-    amount=349900,
+    amount_minor=349900,
     currency="INR",
     created_at=datetime(2026, 10, 21, tzinfo=timezone.utc),
 )
@@ -57,12 +57,21 @@ def client(make_client):
 
 
 def _body(**overrides):
-    body = {"order_id": str(ORDER.id), "payment_method": "upi", "amount": ORDER.amount, "currency": "INR"}
+    body = {"order_id": str(ORDER.id), "payment_method": "upi", "amount_minor": ORDER.amount_minor, "currency": "INR"}
     body.update(overrides)
     return {k: v for k, v in body.items() if v is not None}
 
 
-def _create(client, key="key-1", **overrides):
+def _issued_key(client, order_id=ORDER.id):
+    r = client.get(f"/api/v1/orders/{order_id}")
+    assert r.status_code == 200, r.text
+    return r.json()["payment_idempotency_key"]
+
+
+def _create(client, key=None, **overrides):
+    """POST /payments with the key issued by GET /orders (as the page does)."""
+    if key is None:
+        key = _issued_key(client)
     return client.post("/api/v1/payments", json=_body(**overrides), headers={"Idempotency-Key": key})
 
 
@@ -77,7 +86,54 @@ def _count(session_factory, model=Payment):
 def test_get_order(client):
     r = client.get(f"/api/v1/orders/{ORDER.id}")
     assert r.status_code == 200
-    assert r.json()["amount"] == 349900 and r.json()["summary"] == "2 x T-shirt"
+    body = r.json()
+    assert body["amount_minor"] == 349900 and body["currency"] == "INR" and body["summary"] == "2 x T-shirt"
+    assert body["available_payment_methods"] == ["upi", "card", "netbanking"]
+    assert body["payment_idempotency_key"]
+
+
+def test_order_projection_is_cached_and_key_is_stable(make_client, session_factory):
+    from payment_service.db.models import Order as OrderProjection
+
+    service = InMemoryOrderService([ORDER])
+    client = make_client(order_service=service)
+    first = client.get(f"/api/v1/orders/{ORDER.id}").json()
+    # order-service going away does not matter once the projection exists.
+    client = make_client(order_service=BrokenOrderService())
+    second = client.get(f"/api/v1/orders/{ORDER.id}").json()
+    assert second == first
+    assert _count(session_factory, OrderProjection) == 1
+
+
+def test_key_is_kept_while_attempt_is_in_flight_and_rotated_after_failure(client):
+    key = _issued_key(client)
+    payment = _create(client, key=key).json()
+    assert _issued_key(client) == key  # processing: same key, so a retry replays it
+
+    _webhook(client, _event(payment, type_="payment.failed", failure_reason="declined"))
+    new_key = _issued_key(client)
+    assert new_key != key
+
+    retry = _create(client, key=new_key)
+    assert retry.status_code == 201
+    assert retry.json()["id"] != payment["id"]
+
+
+def test_key_is_not_rotated_after_success(client):
+    key = _issued_key(client)
+    payment = _create(client, key=key).json()
+    _webhook(client, _event(payment))
+    assert _issued_key(client) == key
+    # Re-submitting returns the successful payment; no second charge.
+    again = _create(client, key=key)
+    assert again.status_code == 200 and again.json()["id"] == payment["id"]
+
+
+def test_key_not_issued_by_backend_is_rejected(client, gateway, session_factory):
+    _issued_key(client)
+    r = _create(client, key="made-up-by-client")
+    assert r.status_code == 400
+    assert gateway.calls == [] and _count(session_factory) == 0
 
 
 @pytest.mark.parametrize("order_id", [str(uuid.uuid4()), "nope"])
@@ -99,9 +155,9 @@ def test_create_payment_returns_201_with_checkout(client, gateway):
     body = r.json()
     assert body["status"] == "processing"
     assert body["order_id"] == str(ORDER.id)
-    assert body["amount"] == 349900 and body["currency"] == "INR"
-    assert body["checkout_url"].startswith(f"http://testserver/pay/result.html?orderId={ORDER.id}&paymentId={body['id']}")
-    assert body["gateway_reference"].startswith("gw_")
+    assert body["amount_minor"] == 349900 and body["currency"] == "INR"
+    assert body["gateway_checkout_url"].startswith(f"http://testserver/pay/result.html?orderId={ORDER.id}&paymentId={body['id']}")
+    assert body["gateway_session_id"].startswith("gw_")
     assert len(gateway.calls) == 1
 
 
@@ -110,13 +166,10 @@ def test_create_payment_returns_201_with_checkout(client, gateway):
     [
         {"order_id": None},
         {"order_id": "not-a-uuid"},
-        {"amount": None},
-        {"amount": 0},
-        {"amount": 10.5},
-        {"amount": "349900"},
+        {"amount_minor": 10.5},
+        {"amount_minor": "349900"},
         {"payment_method": None},
         {"payment_method": "cash"},
-        {"currency": None},
     ],
 )
 def test_missing_or_invalid_fields_are_400(client, session_factory, overrides):
@@ -127,11 +180,12 @@ def test_missing_or_invalid_fields_are_400(client, session_factory, overrides):
 
 
 def test_missing_idempotency_key_is_400(client):
+    _issued_key(client)
     r = client.post("/api/v1/payments", json=_body())
     assert r.status_code == 400
 
 
-@pytest.mark.parametrize("field", ["status", "id", "checkout_url"])
+@pytest.mark.parametrize("field", ["status", "id", "gateway_checkout_url", "amount"])
 def test_client_supplied_server_fields_are_rejected(client, session_factory, field):
     r = _create(client, **{field: "success"})
     assert r.status_code == 400
@@ -140,33 +194,50 @@ def test_client_supplied_server_fields_are_rejected(client, session_factory, fie
 
 
 def test_amount_must_match_order(client, session_factory):
-    assert _create(client, amount=1).status_code == 400
+    assert _create(client, amount_minor=1).status_code == 400
     assert _create(client, currency="USD").status_code == 400
     assert _count(session_factory) == 0
 
 
-def test_unknown_order_is_404(client):
-    assert _create(client, order_id=str(uuid.uuid4())).status_code == 404
+def test_amount_is_taken_from_the_order_when_not_sent(client):
+    r = _create(client, amount_minor=None, currency=None)
+    assert r.status_code == 201
+    assert r.json()["amount_minor"] == ORDER.amount_minor and r.json()["currency"] == "INR"
 
 
-def test_order_service_down_is_502(make_client):
-    assert _create(make_client(order_service=BrokenOrderService())).status_code == 502
+def test_method_not_available_for_order_is_400(make_client, session_factory):
+    card_only = Order(
+        id=ORDER.id, summary="s", amount_minor=100, currency="INR",
+        created_at=ORDER.created_at, available_payment_methods=("card",),
+    )
+    client = make_client(order_service=InMemoryOrderService([card_only]))
+    assert _create(client, amount_minor=None, payment_method="upi").status_code == 400
+    assert _count(session_factory) == 0
+
+
+def test_order_never_loaded_is_404(client, gateway):
+    r = _create(client, key="some-key", order_id=str(uuid.uuid4()))
+    assert r.status_code == 404
+    assert gateway.calls == []
 
 
 def test_replayed_key_returns_same_payment_without_second_gateway_call(client, gateway, session_factory):
     first = _create(client).json()
     second = _create(client)
-    assert second.status_code == 201
+    assert second.status_code == 200
     assert second.json()["id"] == first["id"]
     assert len(gateway.calls) == 1
     assert _count(session_factory) == 1
 
 
-def test_reused_key_for_different_amount_or_order_is_409(client, session_factory):
-    _create(client)
-    other = Order(id=uuid.uuid4(), summary="o", amount=100, currency="INR", created_at=ORDER.created_at)
-    assert _create(client, amount=1).status_code == 409
-    assert _create(client, order_id=str(other.id), amount=100).status_code == 409
+def test_reused_key_for_different_order_is_409(make_client, session_factory):
+    other = Order(id=uuid.uuid4(), summary="o", amount_minor=100, currency="INR", created_at=ORDER.created_at)
+    client = make_client(order_service=InMemoryOrderService([ORDER, other]))
+    key = _issued_key(client)
+    _create(client, key=key)
+    _issued_key(client, other.id)
+    r = _create(client, key=key, order_id=str(other.id), amount_minor=100)
+    assert r.status_code == 409
     assert _count(session_factory) == 1
 
 
@@ -179,7 +250,9 @@ def test_gateway_rejection_is_502_and_payment_marked_failed(make_client, session
         payment = s.query(Payment).one()
         assert payment.status == "failed"
         assert "merchant disabled" in payment.failure_reason
-        assert payment.checkout_url is None
+        assert payment.gateway_checkout_url is None
+    # The failed attempt frees the order for a retry with a fresh key.
+    assert _issued_key(client) != payment.idempotency_key
 
 
 # --- GET /api/v1/payments/{paymentId} (REQ-011, REQ-013) --------------------------------
@@ -213,7 +286,7 @@ def _webhook(client, payload, *, secret=SECRET, signature=None, headers=None):
 
 
 def _event(payment, event_id="evt_1", type_="payment.success", **data):
-    return {"id": event_id, "type": type_, "data": {"gateway_reference": payment["gateway_reference"], **data}}
+    return {"id": event_id, "type": type_, "data": {"gateway_reference": payment["gateway_session_id"], **data}}
 
 
 def test_verified_webhook_sets_final_status(client, session_factory):

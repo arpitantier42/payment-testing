@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from payment_service.api.errors import ApiError
 from payment_service.config import Settings
 from payment_service.db import repository as repo
+from payment_service.db.models import Order as OrderProjection
 from payment_service.db.models import Payment, PaymentStatus
 from payment_service.integrations.gateway import (
     GatewayError,
@@ -63,28 +64,56 @@ def _fetch_order(orders: OrderService, order_id: uuid.UUID) -> Order:
     return order
 
 
+def _load_or_project_order(session: Session, orders: OrderService, order_id: uuid.UUID) -> OrderProjection:
+    """Return the cached projection, fetching it from order-service on a cache miss."""
+    projection = repo.get_order(session, order_id)
+    if projection is not None:
+        return projection
+    order = _fetch_order(orders, order_id)
+    try:
+        return repo.upsert_order_projection(
+            session,
+            order_id=order.id,
+            summary=order.summary,
+            amount_minor=order.amount_minor,
+            currency=order.currency,
+            available_payment_methods=list(order.available_payment_methods),
+        )
+    except repo.PaymentValidationError as exc:
+        raise ApiError(502, "order_service_invalid", "Order details are unavailable right now") from exc
+
+
 # --- orders -------------------------------------------------------------------
 
 
 @router.get("/orders/{order_id}")
-def get_order(order_id: str, orders: Annotated[OrderService, Depends(get_order_service)]) -> dict:
+def get_order(
+    order_id: str, session: SessionDep, orders: Annotated[OrderService, Depends(get_order_service)]
+) -> dict:
     parsed = _parse_uuid(order_id)
     if parsed is None:
         raise ApiError(404, "order_not_found", "Order not found")
-    return _fetch_order(orders, parsed).to_dict()
+    projection = _load_or_project_order(session, orders, parsed)
+    repo.ensure_payment_idempotency_key(session, projection)
+    session.commit()
+    return projection.to_dict()
 
 
 # --- payments -------------------------------------------------------------------
 
 
 class CreatePaymentRequest(BaseModel):
-    """Client input for createPayment. Anything else (e.g. ``status``) is rejected with 400."""
+    """Client input for initiatePayment. Anything else (e.g. ``status``) is rejected with 400.
+
+    The charge is always taken from the order projection; ``amount_minor``/``currency``
+    are optional and, when sent, must match it (guards against a stale page).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     order_id: str | None = None
     payment_method: str | None = None
-    amount: StrictInt | None = None
+    amount_minor: StrictInt | None = None
     currency: str | None = None
 
 
@@ -97,27 +126,28 @@ def create_payment(
     body: CreatePaymentRequest,
     session: SessionDep,
     settings: Annotated[Settings, Depends(get_settings)],
-    orders: Annotated[OrderService, Depends(get_order_service)],
     gateway: Annotated[PaymentGateway, Depends(get_gateway)],
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> JSONResponse:
     try:
-        order_id = repo.validate_new_payment(
-            body.order_id, body.payment_method, body.amount, body.currency, idempotency_key
-        )
+        order_id = repo.validate_new_payment(body.order_id, body.payment_method, idempotency_key)
     except repo.PaymentValidationError as exc:
         raise ApiError(400, "invalid_request", str(exc)) from exc
-    assert idempotency_key is not None and body.amount is not None
+    assert idempotency_key is not None
 
     # A replay of the same attempt returns the original payment without new side effects.
     existing = repo.get_payment_by_idempotency_key(session, idempotency_key)
     if existing is not None:
-        if existing.order_id != order_id or existing.amount != body.amount:
+        if existing.order_id != order_id:
             raise ApiError(409, "idempotency_conflict", "Idempotency-Key was already used for a different payment")
-        return _payment_response(existing, 201)
+        return _payment_response(existing, 200)
 
-    order = _fetch_order(orders, order_id)
-    if order.amount != body.amount or order.currency.upper() != body.currency.upper():
+    order = repo.get_order(session, order_id)
+    if order is None:
+        raise ApiError(404, "order_not_found", "Order not found")
+    if (body.amount_minor is not None and body.amount_minor != order.amount_minor) or (
+        body.currency is not None and body.currency.upper() != order.currency
+    ):
         raise ApiError(400, "amount_mismatch", "Amount or currency does not match the order")
 
     try:
@@ -125,21 +155,23 @@ def create_payment(
             session,
             order_id=order_id,
             payment_method=body.payment_method,
-            amount=order.amount,
-            currency=order.currency,
             idempotency_key=idempotency_key,
         )
+    except repo.PaymentValidationError as exc:
+        raise ApiError(400, "invalid_request", str(exc)) from exc
+    except repo.OrderNotFound as exc:
+        raise ApiError(404, "order_not_found", "Order not found") from exc
     except repo.IdempotencyConflict as exc:
         raise ApiError(409, "idempotency_conflict", str(exc)) from exc
     if not created:
         session.commit()
-        return _payment_response(payment, 201)
+        return _payment_response(payment, 200)
 
     return_url = f"{settings.public_base_url}/pay/result.html?orderId={order_id}&paymentId={payment.id}"
     try:
         txn = gateway.create_transaction(
             payment_id=payment.id,
-            amount=payment.amount,
+            amount=payment.amount_minor,
             currency=payment.currency,
             payment_method=payment.payment_method,
             return_url=return_url,
@@ -152,7 +184,10 @@ def create_payment(
         raise ApiError(502, "gateway_error", "The payment gateway could not start this payment") from exc
 
     repo.record_gateway_acceptance(
-        session, payment, checkout_url=txn.checkout_url, gateway_reference=txn.gateway_reference
+        session,
+        payment,
+        gateway_checkout_url=txn.checkout_url,
+        gateway_session_id=txn.gateway_reference,
     )
     session.commit()
     return _payment_response(payment, 201)
@@ -177,7 +212,7 @@ EVENT_STATUS = {
 
 class WebhookData(BaseModel):
     payment_id: str | None = None
-    gateway_reference: str | None = None
+    gateway_reference: str | None = None  # the gateway's session id (payments.gateway_session_id)
     failure_reason: str | None = None
 
 
@@ -191,7 +226,7 @@ def _resolve_payment(session: Session, data: WebhookData) -> Payment | None:
     if data.payment_id:
         return repo.get_payment(session, data.payment_id)
     if data.gateway_reference:
-        return repo.get_payment_by_gateway_reference(session, data.gateway_reference)
+        return repo.get_payment_by_gateway_session_id(session, data.gateway_reference)
     return None
 
 

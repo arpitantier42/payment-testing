@@ -32,7 +32,11 @@ export function isUuid(value) {
   return typeof value === "string" && UUID_RE.test(value);
 }
 
+const CURRENCY_RE = /^[A-Z]{3}$/i;
+
+/** Format minor units with their currency; returns null when either is missing (never a bare number). */
 export function formatAmount(amount, currency) {
+  if (!Number.isInteger(amount) || typeof currency !== "string" || !CURRENCY_RE.test(currency)) return null;
   try {
     return new Intl.NumberFormat(undefined, { style: "currency", currency }).format(amount / 100);
   } catch {
@@ -77,17 +81,35 @@ export function createApi(fetchImpl, baseUrl = "") {
 
 // --- validation (before any request is sent) --------------------------------------
 
-export function validatePaymentInput({ order, paymentMethod }) {
+/** Problems with the order as returned by GET /api/v1/orders/{orderId}; empty when displayable. */
+export function validateOrder(order) {
   const errors = [];
   if (!order || !isUuid(order.id)) errors.push("The order ID is missing.");
-  if (!order || !Number.isInteger(order.amount) || order.amount <= 0) errors.push("The payable amount is missing.");
+  if (!order || !Number.isInteger(order.amount_minor) || order.amount_minor <= 0) errors.push("The payable amount is missing.");
+  if (!order || typeof order.currency !== "string" || !CURRENCY_RE.test(order.currency)) errors.push("The currency is missing.");
+  return errors;
+}
+
+/** Methods the backend allows for this order (all three when it does not say). */
+export function availableMethods(order) {
+  const allowed = order && Array.isArray(order.available_payment_methods) ? order.available_payment_methods : null;
+  return PAYMENT_METHODS.filter((m) => !allowed || allowed.includes(m.value));
+}
+
+export function validatePaymentInput({ order, paymentMethod }) {
+  const errors = validateOrder(order);
   if (!paymentMethod || !METHOD_VALUES.has(paymentMethod)) errors.push("Please select a payment method.");
+  else if (order && !availableMethods(order).some((m) => m.value === paymentMethod)) {
+    errors.push("This payment method is not available for this order.");
+  }
+  if (order && errors.length === 0 && !order.payment_idempotency_key) {
+    errors.push("This payment can't be started yet. Please reload the page.");
+  }
   return errors;
 }
 
 // --- storage keys -------------------------------------------------------------------
 
-export const idempotencyStorageKey = (orderId) => `payment:idempotency-key:${orderId}`;
 export const paymentIdStorageKey = (orderId) => `payment:id:${orderId}`;
 
 // --- Pay Now ----------------------------------------------------------------------------
@@ -98,11 +120,13 @@ export const paymentIdStorageKey = (orderId) => `payment:id:${orderId}`;
  * - Validates input and shows an error instead of calling the API when anything is missing.
  * - Allows exactly one in-flight initiation: the guard is set synchronously, so a second
  *   click (however fast) before the response returns does not send another request.
- * - Reuses the Idempotency-Key for the same attempt when the outcome is unknown (network
- *   error), and starts a fresh key once the backend has answered.
+ * - Sends the Idempotency-Key the backend issued with the order (never one made up here).
+ *   The backend keeps that key until the attempt made with it fails, so a retry after a
+ *   network error replays the same payment; after a failure the page reloads the order
+ *   to receive a fresh key.
  * - Surfaces every failed call as an error view; never proceeds silently.
  */
-export function createPayNowController({ api, storage, newKey, navigate, render }) {
+export function createPayNowController({ api, storage, navigate, render }) {
   let inFlight = false;
 
   async function payNow({ order, paymentMethod }) {
@@ -117,22 +141,14 @@ export function createPayNowController({ api, storage, newKey, navigate, render 
     inFlight = true;
     render({ kind: "submitting", submitting: true });
 
-    const keyName = idempotencyStorageKey(order.id);
-    let key = storage.getItem(keyName);
-    if (!key) {
-      key = newKey();
-      storage.setItem(keyName, key);
-    }
-
     try {
       const payment = await api.createPayment(
-        { order_id: order.id, payment_method: paymentMethod, amount: order.amount, currency: order.currency },
-        key,
+        { order_id: order.id, payment_method: paymentMethod, amount_minor: order.amount_minor, currency: order.currency },
+        order.payment_idempotency_key,
       );
-      storage.removeItem(keyName);
       storage.setItem(paymentIdStorageKey(order.id), payment.id);
 
-      if (payment.status === "failed" || !payment.checkout_url) {
+      if (payment.status === "failed" || !payment.gateway_checkout_url) {
         inFlight = false;
         render({
           kind: "failed",
@@ -144,15 +160,14 @@ export function createPayNowController({ api, storage, newKey, navigate, render 
       }
       // Stay "in flight": the page is leaving for the gateway checkout.
       render({ kind: "redirecting", submitting: true, paymentId: payment.id });
-      navigate(payment.checkout_url);
+      navigate(payment.gateway_checkout_url);
       return { sent: true, payment };
     } catch (err) {
       inFlight = false;
       if (err instanceof NetworkError) {
-        // Outcome unknown: keep the key so a retry cannot create a second payment.
+        // Outcome unknown: the order still carries the same key, so a retry replays it.
         render({ kind: "network", submitting: false, message: "We couldn't reach the payment service. Check your connection and try again." });
       } else {
-        storage.removeItem(keyName);
         render({ kind: "api", submitting: false, status: err.status, message: err.message || "The payment could not be started." });
       }
       return { sent: true, error: err };

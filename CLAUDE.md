@@ -22,7 +22,7 @@ src/payment_service/
   api/app.py                   create_app(settings, session_factory=, order_service=, gateway=) factory
   api/routes.py                /api/v1 routes: orders, payments, gateway webhook
   api/errors.py                ApiError + handlers; validation errors -> 400
-  db/models.py                 ORM: Payment (payments), GatewayWebhookEvent (gateway_webhook_events)
+  db/models.py                 ORM: Order (orders projection), Payment (payments), GatewayWebhookEvent
   db/session.py                make_engine / make_sessionmaker (SQLite tweaks for tests)
   db/repository.py             data-access functions + domain errors
   db/migrations/               Alembic env + versions/NNNN_description.py
@@ -47,14 +47,21 @@ Makefile                       install / test / test-web / run / migrate / db-up
   with `revision = "NNNN"`.
 
 ## API (see ticket OpenAPI)
-- `GET /api/v1/orders/{orderId}` → 200 Order | 404 | 502 (order-service failure).
-- `POST /api/v1/payments` (header `Idempotency-Key`, body `order_id, payment_method, amount, currency`)
-  → 201 Payment (new or replay) | 400 missing/invalid/unknown field or amount≠order | 404 order | 409 key reused
-  for other order/amount | 502 gateway refused (payment stored as failed).
+- `GET /api/v1/orders/{orderId}` → 200 Order `{id, summary, amount_minor, currency, available_payment_methods,
+  payment_idempotency_key, created_at}` | 404 | 502 (order-service failure and no cached projection).
+  Projects the order into `orders` on first sight (cache; never overwritten) and issues/rotates the key.
+- `POST /api/v1/payments` (header `Idempotency-Key` = the order's `payment_idempotency_key`, body
+  `order_id, payment_method, amount_minor?, currency?`) → 201 new Payment | 200 replay of the key |
+  400 missing/invalid/unknown field, method not available, key not issued for the order, or amount/currency ≠ order |
+  404 order never projected | 409 key used for another order | 502 gateway refused (payment stored as failed).
+  Amount/currency are always copied from the projection.
+- Payment JSON: `id, order_id, status, payment_method, amount_minor, currency, idempotency_key,
+  gateway_session_id, gateway_checkout_url, failure_reason, created_at, updated_at`.
 - `GET /api/v1/payments/{paymentId}` → 200 Payment | 404 (unknown or malformed id).
 - `POST /api/v1/payments/webhooks/gateway` (header `X-Gateway-Signature` = hex HMAC-SHA256 of raw body;
   `X-API-Key` checked when `GATEWAY_WEBHOOK_API_KEY` is set). Body
   `{"id", "type": "payment.success|payment.failed|payment.pending", "data": {"payment_id"|"gateway_reference", "failure_reason"?}}`
+  (`gateway_reference` is matched against `payments.gateway_session_id`)
   → 200 applied/duplicate/ignored | 400 unparseable or unknown payment | 401 bad signature (event still recorded).
 - Errors are always `{"error": {"code", "message"}}`; the page shows `message`.
 
@@ -71,8 +78,12 @@ Makefile                       install / test / test-web / run / migrate / db-up
   `PaymentMethod` (upi, card, netbanking). The DB enforces both with CHECK constraints.
 - Repository functions take a `Session`, `flush()` but never `commit()`; route handlers commit.
   Errors map to HTTP: `PaymentValidationError`→400, `IdempotencyConflict`→409, `get_payment(...) is None`→404.
-- Idempotency: replayed key + same order/amount returns the original payment (no second gateway call);
-  the unique index on `idempotency_key` is the final guard against concurrent inserts.
+- Idempotency (server-issued, HLD DEC-001): `repository.ensure_payment_idempotency_key` issues the order's key on
+  first GET and rotates it only once the payment made with it is `failed` (row locked FOR UPDATE on Postgres).
+  A new payment needs exactly the currently issued key; a replayed key for the same order returns the original
+  payment (no second gateway call). Hence a success can never be followed by a second charge on the order. The
+  unique index on `idempotency_key` is the final guard against concurrent inserts.
+- JSON columns use `JSONPayload` (`none_as_null=True`), so Python `None` is SQL NULL and NOT NULL applies.
 - Status is changed only by the backend (gateway acceptance → processing; verified webhook →
   success/failed/pending). success/failed are terminal. Request bodies use `extra="forbid"`, so a
   client-supplied `status` is a 400. Webhook events dedupe by `gateway_event_id`; an unverified
@@ -80,12 +91,16 @@ Makefile                       install / test / test-web / run / migrate / db-up
 - Frontend: never decide success from the gateway redirect (`gateway_status` param is only
   compared and flagged); always show the result of `GET /api/v1/payments/{paymentId}`, using the
   paymentId stored in sessionStorage from the initiation response. Pay Now is guarded by a
-  synchronous in-flight flag + disabled button; the Idempotency-Key is kept in sessionStorage per
-  order and reused only when the outcome is unknown (network error). Distinct views/test ids
-  for validation, network error, API error, failed, pending, success.
+  synchronous in-flight flag + disabled button; the Idempotency-Key is the order's
+  `payment_idempotency_key` (never generated client-side); after an answered error/failed attempt the page
+  reloads the order to get the rotated key. An order missing id/amount/currency (`validateOrder`) or an
+  invalid `orderId` disables Pay Now and shows an error. Methods shown = `available_payment_methods`.
+  Distinct views/test ids for validation, network error, API error, failed, pending, success.
 - order-service and gateway are external: code against the `OrderService` / `PaymentGateway`
-  protocols; the in-repo implementations are dev stubs. There is no `orders` table and no FK
-  from `payments.order_id`.
+  protocols; the in-repo implementations are dev stubs. `orders` is a local projection of
+  order-service data (assumed immutable once placed, HLD RSK-002); `payments.order_id` → `orders.id` FK.
+  `payments.gateway_session_id`/`gateway_checkout_url` stay nullable because a gateway-refused attempt is
+  kept as a failed row (the data model's NOT NULL / "gateway before write" is not adopted yet).
 - Secrets only via environment variables (server side); `.env` is git-ignored, `.env.example` is
   the template. Nothing under `web/` may reference a gateway secret (checked in `tests/test_api.py`).
 - Not built yet: bearer authentication on the customer endpoints (contract lists `bearer`),

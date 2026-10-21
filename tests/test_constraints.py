@@ -5,15 +5,37 @@ import uuid
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from payment_service.db.models import GatewayWebhookEvent, Payment
+from payment_service.db.models import GatewayWebhookEvent, Order, Payment
+
+ORDER_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
+
+
+def _order(**overrides):
+    values = dict(
+        id=ORDER_ID,
+        summary="1 x Mug",
+        amount_minor=49900,
+        currency="INR",
+        available_payment_methods=["upi", "card", "netbanking"],
+    )
+    values.update(overrides)
+    return Order(**values)
+
+
+@pytest.fixture(autouse=True)
+def order(session):
+    o = _order()
+    session.add(o)
+    session.flush()
+    return o
 
 
 def _payment(**overrides):
     values = dict(
-        order_id=uuid.uuid4(),
+        order_id=ORDER_ID,
         status="initiated",
         payment_method="upi",
-        amount=49900,
+        amount_minor=49900,
         currency="INR",
         idempotency_key=str(uuid.uuid4()),
     )
@@ -27,7 +49,7 @@ def test_valid_payment_persists_with_defaults(session):
     session.flush()
     assert isinstance(p.id, uuid.UUID)
     assert p.created_at is not None and p.updated_at is not None
-    assert p.checkout_url is None and p.gateway_reference is None and p.failure_reason is None
+    assert p.gateway_checkout_url is None and p.gateway_session_id is None and p.failure_reason is None
 
 
 def test_duplicate_idempotency_key_is_rejected(session):
@@ -43,8 +65,8 @@ def test_duplicate_idempotency_key_is_rejected(session):
     [
         {"status": "paid"},
         {"payment_method": "cash"},
-        {"amount": 0},
-        {"amount": -100},
+        {"amount_minor": 0},
+        {"amount_minor": -100},
         {"currency": "RUPEE"},
     ],
 )
@@ -54,7 +76,7 @@ def test_invalid_values_are_rejected(session, overrides):
         session.flush()
 
 
-@pytest.mark.parametrize("column", ["order_id", "payment_method", "amount", "currency", "idempotency_key"])
+@pytest.mark.parametrize("column", ["order_id", "payment_method", "amount_minor", "currency", "idempotency_key"])
 def test_required_payment_columns_are_not_null(session, column):
     session.add(_payment(**{column: None}))
     with pytest.raises(IntegrityError):
@@ -99,5 +121,48 @@ def test_duplicate_gateway_event_id_is_rejected(session):
     session.add(_event(p.id, gateway_event_id="evt-1"))
     session.flush()
     session.add(_event(p.id, gateway_event_id="evt-1"))
+    with pytest.raises(IntegrityError):
+        session.flush()
+
+
+# --- orders projection (ENT-002) -----------------------------------------------------
+
+
+def test_order_projection_persists_json_methods_and_null_key(session, order):
+    session.expire_all()
+    stored = session.get(Order, ORDER_ID)
+    assert stored.available_payment_methods == ["upi", "card", "netbanking"]
+    assert stored.payment_idempotency_key is None
+    assert stored.to_dict()["created_at"].endswith("+00:00")
+
+
+def test_payment_requires_existing_order(session):
+    session.add(_payment(order_id=uuid.uuid4()))
+    with pytest.raises(IntegrityError):
+        session.flush()
+
+
+def test_order_payment_idempotency_key_is_unique(session, order):
+    order.payment_idempotency_key = "k-dup"
+    session.add(_order(id=uuid.uuid4(), payment_idempotency_key="k-dup"))
+    with pytest.raises(IntegrityError):
+        session.flush()
+
+
+def test_orders_without_a_key_may_coexist(session):
+    session.add(_order(id=uuid.uuid4()))
+    session.flush()
+
+
+@pytest.mark.parametrize("overrides", [{"amount_minor": 0}, {"currency": "RUPEE"}])
+def test_invalid_order_values_are_rejected(session, overrides):
+    session.add(_order(id=uuid.uuid4(), **overrides))
+    with pytest.raises(IntegrityError):
+        session.flush()
+
+
+@pytest.mark.parametrize("column", ["summary", "amount_minor", "currency", "available_payment_methods"])
+def test_required_order_columns_are_not_null(session, column):
+    session.add(_order(id=uuid.uuid4(), **{column: None}))
     with pytest.raises(IntegrityError):
         session.flush()

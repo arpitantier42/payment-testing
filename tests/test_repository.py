@@ -5,19 +5,35 @@ import pytest
 from sqlalchemy import func, select
 
 from payment_service.db import repository as repo
-from payment_service.db.models import Payment, PaymentStatus
+from payment_service.db.models import Order, Payment, PaymentStatus
 
 ORDER_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
 
 
-def _create(session, **overrides):
+def _project(session, order_id=ORDER_ID, **overrides):
     values = dict(
-        order_id=ORDER_ID,
-        payment_method="card",
-        amount=125000,
+        order_id=order_id,
+        summary="1 x Lamp",
+        amount_minor=125000,
         currency="inr",
-        idempotency_key="key-1",
+        available_payment_methods=["upi", "card", "netbanking"],
     )
+    values.update(overrides)
+    return repo.upsert_order_projection(session, **values)
+
+
+@pytest.fixture(autouse=True)
+def order(session_factory):
+    """A committed projection whose issued key is ``key-1``."""
+    with session_factory() as s:
+        projected = _project(s)
+        repo.ensure_payment_idempotency_key(s, projected, new_key=lambda: "key-1")
+        s.commit()
+    return projected
+
+
+def _create(session, **overrides):
+    values = dict(order_id=ORDER_ID, payment_method="card", idempotency_key="key-1")
     values.update(overrides)
     return repo.create_payment(session, **values)
 
@@ -34,7 +50,7 @@ def test_create_payment_starts_initiated(session):
     session.commit()
     assert created
     assert payment.status == PaymentStatus.INITIATED
-    assert payment.currency == "INR"
+    assert payment.currency == "INR" and payment.amount_minor == 125000  # copied from the order
     assert payment.to_dict()["id"] == str(payment.id)
 
 
@@ -43,15 +59,11 @@ def test_create_payment_starts_initiated(session):
     [
         {"order_id": None},
         {"order_id": "not-a-uuid"},
-        {"amount": None},
-        {"amount": 0},
-        {"amount": 10.5},
-        {"amount": True},
         {"payment_method": None},
         {"payment_method": "cash"},
-        {"currency": "IN"},
         {"idempotency_key": ""},
         {"idempotency_key": None},
+        {"idempotency_key": "not-issued"},
     ],
 )
 def test_missing_or_invalid_fields_are_rejected_without_insert(session, overrides):
@@ -71,18 +83,82 @@ def test_replayed_key_returns_original_payment(session):
     assert _count(session) == 1
 
 
-def test_reused_key_with_different_order_or_amount_conflicts(session):
+def test_reused_key_with_different_order_conflicts(session):
     _create(session)
-    with pytest.raises(repo.IdempotencyConflict):
-        _create(session, amount=1)
     with pytest.raises(repo.IdempotencyConflict):
         _create(session, order_id=uuid.uuid4())
     assert _count(session) == 1
 
 
-def test_new_key_for_same_order_creates_a_new_attempt(session):
-    _create(session, idempotency_key="a")
-    _create(session, idempotency_key="b")
+def test_unknown_order_is_not_found(session):
+    with pytest.raises(repo.OrderNotFound):
+        _create(session, order_id=uuid.uuid4(), idempotency_key="fresh")
+    assert _count(session) == 0
+
+
+def test_method_must_be_available_for_the_order(session):
+    other = _project(session, uuid.uuid4(), available_payment_methods=["card"])
+    key = repo.ensure_payment_idempotency_key(session, other)
+    with pytest.raises(repo.PaymentValidationError):
+        _create(session, order_id=other.id, payment_method="upi", idempotency_key=key)
+
+
+# --- order projection and key issuance (REQ-002/005/006, REQ-015/016) ---------------
+
+
+def test_projection_is_stored_once_and_not_overwritten(session):
+    again = _project(session, summary="changed", amount_minor=1)
+    assert again.summary == "1 x Lamp" and again.amount_minor == 125000
+    assert session.scalar(select(func.count()).select_from(Order)) == 1
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"summary": None},
+        {"amount_minor": 0},
+        {"amount_minor": True},
+        {"currency": "IN"},
+        {"available_payment_methods": []},
+        {"available_payment_methods": ["cash"]},
+    ],
+)
+def test_invalid_projection_is_rejected(session, overrides):
+    with pytest.raises(repo.PaymentValidationError):
+        _project(session, uuid.uuid4(), **overrides)
+
+
+def test_get_order_handles_unknown_and_malformed_ids(session):
+    assert repo.get_order(session, ORDER_ID).id == ORDER_ID
+    assert repo.get_order(session, uuid.uuid4()) is None
+    assert repo.get_order(session, "nope") is None
+
+
+def test_key_is_issued_once_and_kept_while_unused_or_in_flight(session, order):
+    assert repo.ensure_payment_idempotency_key(session, order) == "key-1"
+    payment, _ = _create(session)
+    for status in (PaymentStatus.PROCESSING, PaymentStatus.PENDING):
+        payment.status = status.value
+        assert repo.ensure_payment_idempotency_key(session, order) == "key-1"
+
+
+def test_key_is_kept_after_success(session, order):
+    payment, _ = _create(session)
+    repo.update_payment_status(session, payment, PaymentStatus.SUCCESS)
+    assert repo.ensure_payment_idempotency_key(session, order) == "key-1"
+    replay, created = _create(session)
+    assert replay.id == payment.id and not created
+
+
+def test_key_rotates_after_failure_and_retry_creates_new_attempt(session, order):
+    payment, _ = _create(session)
+    repo.update_payment_status(session, payment, PaymentStatus.FAILED, failure_reason="declined")
+    new_key = repo.ensure_payment_idempotency_key(session, order)
+    assert new_key != "key-1"
+    # The old key now replays the failed attempt; only the new key can start a new one.
+    assert _create(session)[0].id == payment.id
+    retry, created = _create(session, idempotency_key=new_key)
+    assert created and retry.id != payment.id
     assert _count(session) == 2
 
 
@@ -149,10 +225,10 @@ def test_get_unknown_or_invalid_payment_returns_none(session, bad_id):
 def test_gateway_acceptance_sets_processing_and_correlation(session):
     payment, _ = _create(session)
     repo.record_gateway_acceptance(
-        session, payment, checkout_url="https://gw.example/checkout/abc", gateway_reference="gw_abc"
+        session, payment, gateway_checkout_url="https://gw.example/checkout/abc", gateway_session_id="gw_abc"
     )
     assert payment.status == PaymentStatus.PROCESSING
-    assert repo.get_payment_by_gateway_reference(session, "gw_abc").id == payment.id
+    assert repo.get_payment_by_gateway_session_id(session, "gw_abc").id == payment.id
 
 
 def test_failed_requires_reason_and_reason_only_for_failed(session):
