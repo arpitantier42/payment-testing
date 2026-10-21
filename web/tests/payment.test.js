@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+  ACCESS_TOKEN_STORAGE_KEY,
   ApiError,
+  apiErrorMessage,
+  readAccessToken,
   NetworkError,
   confirmPaymentStatus,
   createApi,
@@ -451,5 +454,65 @@ describe("api client", () => {
     await assert.rejects(down.getPayment(PAYMENT_ID), NetworkError);
     const notFound = createApi(() => jsonResponse(404, { error: { code: "payment_not_found", message: "nope" } }));
     await assert.rejects(notFound.getPayment(PAYMENT_ID), (err) => err instanceof ApiError && err.status === 404);
+  });
+});
+
+describe("bearer session token (REQ-017: only the customer's own token, never a gateway credential)", () => {
+  it("sends the token as Authorization: Bearer on every call", async () => {
+    const seen = [];
+    const fetch = (url, options = {}) => {
+      seen.push({ url, headers: options.headers || {} });
+      return jsonResponse(200, { id: PAYMENT_ID, status: "pending" });
+    };
+    const api = createApi(fetch, "", { getToken: () => "tok-123" });
+    await api.getOrder(ORDER.id);
+    await api.getPayment(PAYMENT_ID);
+    await api.createPayment({ order_id: ORDER.id, payment_method: "upi" }, "key-1");
+    assert.equal(seen.length, 3);
+    for (const call of seen) assert.equal(call.headers.Authorization, "Bearer tok-123");
+    assert.equal(seen[2].headers["Idempotency-Key"], "key-1");
+  });
+
+  it("sends no Authorization header when there is no token", async () => {
+    let headers;
+    const api = createApi((url, options = {}) => {
+      headers = options.headers;
+      return jsonResponse(200, {});
+    });
+    await api.getOrder(ORDER.id);
+    assert.equal(headers, undefined);
+  });
+
+  it("takes the token from the URL fragment once and keeps it for the tab", () => {
+    const storage = memoryStorage();
+    assert.deepEqual(readAccessToken({ hash: "#token=abc.def", storage }), { token: "abc.def", consumedFromHash: true });
+    assert.equal(storage.getItem(ACCESS_TOKEN_STORAGE_KEY), "abc.def");
+    // Result page after the gateway redirect: no fragment, same tab storage.
+    assert.deepEqual(readAccessToken({ hash: "", storage }), { token: "abc.def", consumedFromHash: false });
+    assert.deepEqual(readAccessToken({ hash: "", storage: memoryStorage() }), { token: null, consumedFromHash: false });
+  });
+
+  it("explains an expired session instead of a generic error", () => {
+    assert.match(apiErrorMessage(new ApiError(401, "unauthorized", "x")), /session has expired/);
+    assert.equal(apiErrorMessage(new ApiError(400, "invalid_request", "bad"), "fallback"), "bad");
+    assert.equal(apiErrorMessage(null, "fallback"), "fallback");
+  });
+
+  it("a 401 on Pay Now is shown as an error and does not redirect", async () => {
+    const views = [];
+    const navigated = [];
+    const fetch = () => jsonResponse(401, { error: { code: "unauthorized", message: "Your session is invalid." } });
+    const controller = createPayNowController({
+      api: createApi(fetch, "", { getToken: () => "expired" }),
+      storage: memoryStorage(),
+      navigate: (url) => navigated.push(url),
+      render: (v) => views.push(v),
+      setTimer: () => {},
+    });
+    await controller.payNow({ order: ORDER, paymentMethod: "upi" });
+    assert.equal(navigated.length, 0);
+    assert.equal(views.at(-1).kind, "api");
+    assert.equal(views.at(-1).status, 401);
+    assert.equal(controller.isInFlight(), false);
   });
 });

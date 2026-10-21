@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import sessionmaker
 
 from payment_service.api.errors import install_error_handlers
-from payment_service.api.routes import router
+from payment_service.api.routes import router, webhook_router
 from payment_service.config import Settings
 from payment_service.db.session import make_engine, make_sessionmaker
 from payment_service.integrations.gateway import FakeGateway, PaymentGateway
@@ -25,7 +25,8 @@ def create_app(
     order_service: OrderService | None = None,
     gateway: PaymentGateway | None = None,
 ) -> FastAPI:
-    settings = settings or Settings.from_env()
+    # Refuse to start without the secrets the service needs (raises ConfigError).
+    settings = (settings or Settings.from_env()).validate()
     app = FastAPI(title="Payment Service", version="1.0.1")
     app.state.settings = settings
     app.state.session_factory = session_factory or make_sessionmaker(make_engine(settings.database_url))
@@ -34,7 +35,13 @@ def create_app(
     app.state.gateway = gateway or FakeGateway()
 
     install_error_handlers(app)
+    app.include_router(webhook_router)
     app.include_router(router)
+
+    @app.get("/healthz", include_in_schema=False)
+    def _healthz() -> dict:
+        # Liveness for compose/orchestrators; unauthenticated and reveals no configuration.
+        return {"status": "ok"}
 
     if settings.web_dir.is_dir():
         app.mount("/pay", StaticFiles(directory=settings.web_dir, html=True), name="web")

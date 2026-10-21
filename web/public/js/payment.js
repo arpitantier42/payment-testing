@@ -52,8 +52,11 @@ export const REQUEST_TIMEOUT_MS = 15000;
  * API client. A request that gets no answer within `timeoutMs` is aborted and reported
  * as a NetworkError, so no view ever waits on the network indefinitely.
  */
-export function createApi(fetchImpl, baseUrl = "", { timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
+export function createApi(fetchImpl, baseUrl = "", { timeoutMs = REQUEST_TIMEOUT_MS, getToken = () => null } = {}) {
   async function request(path, options = {}) {
+    // The customer's session token (never a gateway credential) goes in Authorization.
+    const token = getToken();
+    if (token) options = { ...options, headers: { ...(options.headers || {}), Authorization: `Bearer ${token}` } };
     let response;
     const controller = typeof AbortController === "function" ? new AbortController() : null;
     let timer = null;
@@ -130,6 +133,28 @@ export function validatePaymentInput({ order, paymentMethod }) {
 // --- storage keys -------------------------------------------------------------------
 
 export const paymentIdStorageKey = (orderId) => `payment:id:${orderId}`;
+export const ACCESS_TOKEN_STORAGE_KEY = "payment:access-token";
+
+/**
+ * The customer's bearer token for payment-service. Order placement opens the page with
+ * `#token=...` (a fragment is never sent to servers or written to access logs); it is kept
+ * in sessionStorage for this tab, so the result page after the gateway redirect has it too.
+ * Returns `{ token, consumedFromHash }` so the caller can strip the fragment from the URL.
+ */
+export function readAccessToken({ hash, storage }) {
+  const fromHash = new URLSearchParams(String(hash || "").replace(/^#/, "")).get("token");
+  if (fromHash) {
+    storage.setItem(ACCESS_TOKEN_STORAGE_KEY, fromHash);
+    return { token: fromHash, consumedFromHash: true };
+  }
+  return { token: storage.getItem(ACCESS_TOKEN_STORAGE_KEY), consumedFromHash: false };
+}
+
+/** Customer-facing text for an API error (401 = the session token is missing/expired). */
+export function apiErrorMessage(err, fallback) {
+  if (err && err.status === 401) return "Your session has expired. Please return to your order and open the payment page again.";
+  return (err && err.message) || fallback;
+}
 
 // --- Pay Now ----------------------------------------------------------------------------
 

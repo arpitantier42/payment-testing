@@ -1,13 +1,18 @@
 import {
+  apiErrorMessage,
   availableMethods,
   createApi,
   createPayNowController,
   formatAmount,
   isUuid,
+  readAccessToken,
   validateOrder,
 } from "./payment.js";
 
-const api = createApi(window.fetch.bind(window));
+const { token, consumedFromHash } = readAccessToken({ hash: window.location.hash, storage: window.sessionStorage });
+// Drop the token from the address bar so it is not bookmarked, shared or kept in history.
+if (consumedFromHash) window.history.replaceState(null, "", window.location.pathname + window.location.search);
+const api = createApi(window.fetch.bind(window), "", { getToken: () => token });
 const params = new URLSearchParams(window.location.search);
 const orderId = params.get("orderId");
 
@@ -128,7 +133,13 @@ async function loadOrder({ keepMessage = false } = {}) {
   try {
     loaded = await api.getOrder(orderId);
   } catch (err) {
-    showOrderUnavailable(err.status === 404 ? "We couldn't find this order." : "We couldn't load your order. Please try again.");
+    showOrderUnavailable(
+      err.status === 404
+        ? "We couldn't find this order."
+        : err.status === 401
+          ? apiErrorMessage(err)
+          : "We couldn't load your order. Please try again.",
+    );
     return;
   }
   const problems = validateOrder(loaded);

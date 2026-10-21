@@ -1,6 +1,8 @@
-import { createApi, pollConfirmedStatus, resolvePaymentId } from "./payment.js";
+import { createApi, pollConfirmedStatus, readAccessToken, resolvePaymentId } from "./payment.js";
 
-const api = createApi(window.fetch.bind(window));
+// Same tab as the pay page, so the session token is already in sessionStorage.
+const { token } = readAccessToken({ hash: window.location.hash, storage: window.sessionStorage });
+const api = createApi(window.fetch.bind(window), "", { getToken: () => token });
 const params = new URLSearchParams(window.location.search);
 const orderId = params.get("orderId");
 // Gateway redirect parameters are a hint only; they never decide the shown result.

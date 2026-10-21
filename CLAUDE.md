@@ -18,10 +18,13 @@ Design docs (OpenAPI, data model, HLD/LLD) come with each ticket.
 pyproject.toml                 dependencies, pytest config (pythonpath=src)
 alembic.ini                    Alembic config; URL comes from DATABASE_URL
 src/payment_service/
-  config.py                    Settings.from_env(): DATABASE_URL, PUBLIC_BASE_URL, GATEWAY_WEBHOOK_SECRET, ...
-  api/app.py                   create_app(settings, session_factory=, order_service=, gateway=) factory
-  api/routes.py                /api/v1 routes: orders, payments, gateway webhook
-  api/errors.py                ApiError + handlers; validation errors -> 400
+  config.py                    Settings.from_env() + validate() (ConfigError); secrets have repr=False
+  auth.py                      bearer tokens: issue_token / verify_token -> Principal; dev CLI (python -m)
+  secret_scan.py               REQ-017 scan of web/public (python -m payment_service.secret_scan)
+  api/app.py                   create_app(settings, session_factory=, order_service=, gateway=) factory; /healthz
+  api/routes.py                /api/v1 routes: `router` (customer, bearer) + `webhook_router` (gateway)
+  api/security.py              require_principal dependency (router-level on `router`), PrincipalDep
+  api/errors.py                ApiError(+headers) + handlers; validation errors -> 400
   db/models.py                 ORM: Order (orders projection), Payment (payments), GatewayWebhookEvent
   db/session.py                make_engine / make_sessionmaker (SQLite tweaks for tests)
   db/repository.py             data-access functions + domain errors
@@ -32,21 +35,29 @@ web/public/                    index.html (pay page), result.html (confirmed res
 web/tests/                     node --test unit tests for js/payment.js
 dev/orders.json                demo order for the order-service stub
 tests/                         conftest.py (migrated DB per test), test_*.py
-docker-compose.yml, Dockerfile Postgres, migration runner, API
-Makefile                       install / test / test-web / run / migrate / db-up / test-pg
+docker-compose.yml, Dockerfile Postgres, migration runner, API (healthcheck on /healthz)
+.github/workflows/ci.yml       secret scan, pytest on SQLite and Postgres, docker build
+Makefile                       install / test / test-web / scan-web / dev-token / run / migrate / db-up / test-pg
 ```
 
 ## Commands
 - Install: `python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'` (or `make install`)
 - Test everything: `.venv/bin/pytest` (or `make test`). Frontend only: `cd web && npm test`.
 - Run locally on SQLite: `DATABASE_URL=sqlite:///./dev.db GATEWAY_WEBHOOK_SECRET=dev .venv/bin/alembic upgrade head`
-  then `make run` with the same env; open `http://localhost:8000/pay/?orderId=6f1c2b8e-3d4a-4c5b-9e7f-112233445566`.
-- Postgres via Docker: `docker compose up api` (starts db, runs migrations, serves on :8000).
+  then `make run` with the same env plus `AUTH_TOKEN_SECRET=<16+ chars>`; `make dev-token` (same env) prints a
+  pay-page URL with `#token=...`. Or set `AUTH_DISABLED=true` and open
+  `http://localhost:8000/pay/?orderId=6f1c2b8e-3d4a-4c5b-9e7f-112233445566`.
+- Postgres via Docker: `docker compose up api` (starts db, runs migrations, serves on :8000); token:
+  `docker compose exec api python -m payment_service.auth --order-id <uuid>`.
+- Secret scan of the page: `make scan-web` (also in CI and `tests/test_secret_scan.py`).
 - Tests on Postgres: `make test-pg` (uses the `payment_test` database created by compose).
 - New migration: `.venv/bin/alembic revision -m "..."`, then rename the file to `NNNN_description.py`
   with `revision = "NNNN"`.
 
 ## API (see ticket OpenAPI)
+- Customer endpoints (orders, payments) need `Authorization: Bearer <token>` → else 401 `unauthorized` with
+  `WWW-Authenticate: Bearer`. A token scoped to an order (`order_id` claim) gets 404 for any other order and
+  its payments. Webhook and `/healthz` take no bearer token.
 - `GET /api/v1/orders/{orderId}` → 200 Order `{id, summary, amount_minor, currency, available_payment_methods,
   payment_idempotency_key, created_at}` | 404 | 502 (order-service failure and no cached projection).
   Projects the order into `orders` on first sight (cache; never overwritten) and issues/rotates the key.
@@ -58,7 +69,7 @@ Makefile                       install / test / test-web / run / migrate / db-up
 - Payment JSON: `id, order_id, status, payment_method, amount_minor, currency, idempotency_key,
   gateway_session_id, gateway_checkout_url, failure_reason, created_at, updated_at`.
 - `GET /api/v1/payments/{paymentId}` → 200 Payment | 404 (unknown or malformed id).
-- `POST /api/v1/payments/webhooks/gateway` (header `X-Gateway-Signature` = hex HMAC-SHA256 of raw body;
+- `POST /api/v1/payments/webhook` (contract path; alias `/api/v1/payments/webhooks/gateway`) (header `X-Gateway-Signature` = hex HMAC-SHA256 of raw body;
   `X-API-Key` checked when `GATEWAY_WEBHOOK_API_KEY` is set). Body
   `{"id", "type": "payment.success|payment.failed|payment.pending", "data": {"payment_id"|"gateway_reference", "failure_reason"?}}`
   (`gateway_reference` is matched against `payments.gateway_session_id`)
@@ -109,6 +120,17 @@ Makefile                       install / test / test-web / run / migrate / db-up
   `payments.gateway_session_id`/`gateway_checkout_url` stay nullable because a gateway-refused attempt is
   kept as a failed row (the data model's NOT NULL / "gateway before write" is not adopted yet).
 - Secrets only via environment variables (server side); `.env` is git-ignored, `.env.example` is
-  the template. Nothing under `web/` may reference a gateway secret (checked in `tests/test_api.py`).
-- Not built yet: bearer authentication on the customer endpoints (contract lists `bearer`),
-  real order-service/gateway adapters, fallback gateway status polling.
+  the template. `create_app` calls `Settings.validate()`: no `GATEWAY_WEBHOOK_SECRET`, or no
+  `AUTH_TOKEN_SECRET` (≥16 chars) unless `AUTH_DISABLED=true`, → `ConfigError` at startup. New secret settings:
+  add with `field(repr=False)`, list in `secret_scan.SECRET_SETTINGS`, document in `.env.example`.
+  Nothing under `web/` may reference a gateway secret (`secret_scan`, `tests/test_api.py`).
+- Auth (HLD RSK-004, placeholder until the real session issuer is known): tokens are
+  `b64url(json{sub, exp, order_id?}).b64url(HMAC-SHA256)` keyed by `AUTH_TOKEN_SECRET`. New customer routes go
+  on `router` (auth is automatic) and take `principal: PrincipalDep` to check `principal.may_access_order(...)`
+  (mismatch → 404, not 403). Gateway-called routes go on `webhook_router`. Tests: `make_client` in
+  `tests/test_api.py` sends a valid token by default (`token=None` override for none).
+- Frontend auth: the page is opened as `/pay/?orderId=...#token=...`; `readAccessToken` moves the token into
+  sessionStorage (`payment:access-token`), the page strips the fragment, and `createApi(..., {getToken})` sends
+  `Authorization: Bearer`. The token is the customer's session, never a gateway credential.
+- Not built yet: the real token issuer (order placement), real order-service/gateway adapters,
+  fallback gateway status polling.

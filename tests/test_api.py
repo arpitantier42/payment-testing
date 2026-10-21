@@ -6,12 +6,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from payment_service.api.app import create_app
+from payment_service.auth import issue_token
 from payment_service.config import REPO_ROOT, Settings
 from payment_service.db.models import GatewayWebhookEvent, Payment
 from payment_service.integrations.gateway import FakeGateway, sign_payload
 from payment_service.integrations.orders import InMemoryOrderService, Order, OrderServiceError
 
 SECRET = "test-webhook-secret"
+AUTH_SECRET = "test-auth-token-secret"
 ORDER = Order(
     id=uuid.UUID("6f1c2b8e-3d4a-4c5b-9e7f-112233445566"),
     summary="2 x T-shirt",
@@ -38,6 +40,7 @@ def make_client(db_url, session_factory, gateway):
             database_url=db_url,
             public_base_url="http://testserver",
             gateway_webhook_secret=SECRET,
+            auth_token_secret=AUTH_SECRET,
             web_dir=REPO_ROOT / "web" / "public",
         )
         app = create_app(
@@ -46,7 +49,9 @@ def make_client(db_url, session_factory, gateway):
             order_service=overrides.get("order_service", InMemoryOrderService([ORDER])),
             gateway=overrides.get("gateway", gateway),
         )
-        return TestClient(app)
+        # Customer calls carry a bearer token, as the payment page does.
+        token = overrides.get("token", issue_token(AUTH_SECRET, subject="customer-1"))
+        return TestClient(app, headers={"Authorization": f"Bearer {token}"} if token else None)
 
     return _make
 
@@ -347,7 +352,9 @@ def test_unparseable_webhook_is_400(client, raw):
 
 
 def test_webhook_api_key_enforced_when_configured(db_url, session_factory, gateway):
-    settings = Settings(database_url=db_url, gateway_webhook_secret=SECRET, gateway_webhook_api_key="k")
+    settings = Settings(
+        database_url=db_url, gateway_webhook_secret=SECRET, gateway_webhook_api_key="k", auth_disabled=True
+    )
     client = TestClient(
         create_app(settings, session_factory=session_factory, order_service=InMemoryOrderService([ORDER]), gateway=gateway)
     )

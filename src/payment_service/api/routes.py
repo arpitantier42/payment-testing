@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, StrictInt, ValidationError
 from sqlalchemy.orm import Session
 
 from payment_service.api.errors import ApiError
+from payment_service.api.security import PrincipalDep, require_principal
 from payment_service.config import Settings
 from payment_service.db import repository as repo
 from payment_service.db.models import Order as OrderProjection
@@ -24,7 +25,10 @@ from payment_service.integrations.gateway import (
 )
 from payment_service.integrations.orders import Order, OrderService, OrderServiceError
 
-router = APIRouter(prefix="/api/v1")
+# Customer endpoints: every route here requires a valid bearer token (contract scheme `bearer`).
+router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_principal)])
+# Gateway-to-server endpoints: authenticated by X-API-Key + HMAC signature instead.
+webhook_router = APIRouter(prefix="/api/v1")
 
 
 def get_session(request: Request) -> Iterator[Session]:
@@ -88,10 +92,13 @@ def _load_or_project_order(session: Session, orders: OrderService, order_id: uui
 
 @router.get("/orders/{order_id}")
 def get_order(
-    order_id: str, session: SessionDep, orders: Annotated[OrderService, Depends(get_order_service)]
+    order_id: str,
+    session: SessionDep,
+    principal: PrincipalDep,
+    orders: Annotated[OrderService, Depends(get_order_service)],
 ) -> dict:
     parsed = _parse_uuid(order_id)
-    if parsed is None:
+    if parsed is None or not principal.may_access_order(parsed):
         raise ApiError(404, "order_not_found", "Order not found")
     projection = _load_or_project_order(session, orders, parsed)
     repo.ensure_payment_idempotency_key(session, projection)
@@ -125,6 +132,7 @@ def _payment_response(payment: Payment, status_code: int = 200) -> JSONResponse:
 def create_payment(
     body: CreatePaymentRequest,
     session: SessionDep,
+    principal: PrincipalDep,
     settings: Annotated[Settings, Depends(get_settings)],
     gateway: Annotated[PaymentGateway, Depends(get_gateway)],
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
@@ -134,6 +142,8 @@ def create_payment(
     except repo.PaymentValidationError as exc:
         raise ApiError(400, "invalid_request", str(exc)) from exc
     assert idempotency_key is not None
+    if not principal.may_access_order(order_id):
+        raise ApiError(404, "order_not_found", "Order not found")
 
     # A replay of the same attempt returns the original payment without new side effects.
     existing = repo.get_payment_by_idempotency_key(session, idempotency_key)
@@ -194,9 +204,9 @@ def create_payment(
 
 
 @router.get("/payments/{payment_id}")
-def get_payment(payment_id: str, session: SessionDep) -> JSONResponse:
+def get_payment(payment_id: str, session: SessionDep, principal: PrincipalDep) -> JSONResponse:
     payment = repo.get_payment(session, payment_id)
-    if payment is None:
+    if payment is None or not principal.may_access_order(payment.order_id):
         raise ApiError(404, "payment_not_found", "Payment not found")
     return _payment_response(payment)
 
@@ -230,7 +240,10 @@ def _resolve_payment(session: Session, data: WebhookData) -> Payment | None:
     return None
 
 
-@router.post("/payments/webhooks/gateway")
+# `/payments/webhook` is the contract path; `/payments/webhooks/gateway` is kept for
+# gateways already configured with it.
+@webhook_router.post("/payments/webhook")
+@webhook_router.post("/payments/webhooks/gateway")
 async def receive_gateway_webhook(
     request: Request,
     session: SessionDep,
