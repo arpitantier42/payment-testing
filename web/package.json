@@ -1,0 +1,9 @@
+{
+  "name": "payment-web",
+  "private": true,
+  "type": "module",
+  "description": "Payment page (static, no build step). Logic in public/js/payment.js.",
+  "scripts": {
+    "test": "node --test tests/"
+  }
+}

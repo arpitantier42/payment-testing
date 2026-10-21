@@ -1,7 +1,7 @@
 VENV ?= .venv
 PY := $(VENV)/bin/python
 
-.PHONY: install test migrate downgrade db-up db-down test-pg
+.PHONY: install test test-web run migrate downgrade db-up db-down test-pg
 
 $(PY):
 	python3 -m venv $(VENV)
@@ -11,6 +11,13 @@ install: $(PY)
 
 test:
 	$(PY) -m pytest
+
+test-web:
+	cd web && npm test
+
+# Requires DATABASE_URL and GATEWAY_WEBHOOK_SECRET (see .env.example).
+run:
+	$(VENV)/bin/uvicorn --factory payment_service.api.app:create_app --reload --port 8000
 
 # Requires DATABASE_URL (see .env.example).
 migrate:

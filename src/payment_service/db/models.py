@@ -107,9 +107,16 @@ class Payment(Base):
             "checkout_url": self.checkout_url,
             "gateway_reference": self.gateway_reference,
             "failure_reason": self.failure_reason,
-            "created_at": self.created_at.isoformat(),
-            "updated_at": self.updated_at.isoformat(),
+            "created_at": _iso_utc(self.created_at),
+            "updated_at": _iso_utc(self.updated_at),
         }
+
+
+def _iso_utc(value: datetime) -> str:
+    # SQLite returns naive datetimes; every timestamp we store is UTC.
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat()
 
 
 class GatewayWebhookEvent(Base):

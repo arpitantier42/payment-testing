@@ -47,7 +47,7 @@ def _parse_uuid(value: uuid.UUID | str | None) -> uuid.UUID | None:
         return None
 
 
-def _validate_new_payment(
+def validate_new_payment(
     order_id: uuid.UUID | str | None,
     payment_method: str | None,
     amount: int | None,
@@ -111,7 +111,7 @@ def create_payment(
     and amount returns the original payment with ``created=False``; the unique
     constraint on ``idempotency_key`` settles concurrent inserts.
     """
-    parsed_order_id = _validate_new_payment(
+    parsed_order_id = validate_new_payment(
         order_id, payment_method, amount, currency, idempotency_key
     )
     assert idempotency_key is not None and amount is not None
@@ -193,10 +193,20 @@ def record_webhook_event(
     """Store an inbound gateway event once per ``gateway_event_id``.
 
     Returns ``(event, created)``; a redelivered event returns the stored row with
-    ``created=False`` so the caller can skip re-applying it.
+    ``created=False`` so the caller can skip re-applying it. A stored event whose
+    signature failed is replaced by a later verified delivery (``created=True``),
+    so a forged request cannot block the genuine event by claiming its id first.
     """
     existing = get_webhook_event_by_gateway_id(session, gateway_event_id)
     if existing is not None:
+        if signature_valid and not existing.signature_valid:
+            existing.payment_id = payment_id
+            existing.event_type = event_type
+            existing.signature_valid = True
+            existing.raw_payload = raw_payload
+            existing.received_at = utcnow()
+            session.flush()
+            return existing, True
         return existing, False
 
     event = GatewayWebhookEvent(

@@ -1,6 +1,7 @@
-# Local payment-db (Postgres) plus a one-shot migration runner.
+# Local payment-db (Postgres), a one-shot migration runner and the API + payment page.
 #   docker compose up -d db          # start Postgres
 #   docker compose run --rm migrate  # apply migrations (alembic upgrade head)
+#   docker compose up api            # http://localhost:8000/pay/?orderId=6f1c2b8e-3d4a-4c5b-9e7f-112233445566
 services:
   db:
     image: postgres:16
@@ -27,6 +28,18 @@ services:
     depends_on:
       db:
         condition: service_healthy
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg://payment:payment@db:5432/payment
+      PUBLIC_BASE_URL: http://localhost:8000
+      GATEWAY_WEBHOOK_SECRET: ${GATEWAY_WEBHOOK_SECRET:-dev-only-webhook-secret}
+    ports:
+      - "8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   payment-db-data:
