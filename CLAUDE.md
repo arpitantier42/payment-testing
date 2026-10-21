@@ -96,6 +96,13 @@ Makefile                       install / test / test-web / run / migrate / db-up
   reloads the order to get the rotated key. An order missing id/amount/currency (`validateOrder`) or an
   invalid `orderId` disables Pay Now and shows an error. Methods shown = `available_payment_methods`.
   Distinct views/test ids for validation, network error, API error, failed, pending, success.
+- Never hang (REQ-009 AC2): `createApi` aborts requests after `REQUEST_TIMEOUT_MS` (→ NetworkError);
+  after hand-off the Pay Now controller arms a `CHECKOUT_TIMEOUT_MS` timer (injectable `setTimer`) that
+  confirms the payment via GET if the page is still there; `controller.resume(orderId)` does the same on
+  page load and on `pageshow` from the back/forward cache (Back from the gateway) and renders a
+  `confirmed` view (success keeps Pay Now locked). The result page uses `pollConfirmedStatus` (bounded
+  re-checks while pending, then settles on Pending + "Check again"). Unit tests inject `setTimer`/`sleep`
+  so no real timers keep `node --test` alive.
 - order-service and gateway are external: code against the `OrderService` / `PaymentGateway`
   protocols; the in-repo implementations are dev stubs. `orders` is a local projection of
   order-service data (assumed immutable once placed, HLD RSK-002); `payments.order_id` → `orders.id` FK.

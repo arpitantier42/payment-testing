@@ -10,6 +10,7 @@ import {
   createPayNowController,
   formatAmount,
   paymentIdStorageKey,
+  pollConfirmedStatus,
   resolvePaymentId,
   validateOrder,
   validatePaymentInput,
@@ -55,12 +56,14 @@ function deferred() {
   return { promise, resolve };
 }
 
-function setup(respond) {
+function setup(respond, extra = {}) {
   const { fetch, calls } = fakeFetch(respond);
   const views = [];
   const navigations = [];
-  const storage = memoryStorage();
+  const storage = extra.storage || memoryStorage();
   const controller = createPayNowController({
+    setTimer: () => {}, // no real 10-minute checkout timer in unit tests
+    ...extra,
     api: createApi(fetch),
     storage,
     navigate: (url) => navigations.push(url),
@@ -311,6 +314,134 @@ describe("confirmed status from the backend (AC3, AC4, AC5, AC6, AC9)", () => {
     const { fetch } = fakeFetch(() => Promise.reject(new TypeError("offline")));
     const view = await confirmPaymentStatus({ api: createApi(fetch), paymentId: PAYMENT_ID, gatewayHint: "success" });
     assert.equal(view.kind, "network");
+  });
+});
+
+describe("after the gateway checkout: abandoned or returned (REQ-009 AC2, REQ-010, REQ-011, REQ-013)", () => {
+  const paymentBody = (status, extra = {}) => jsonResponse(200, { id: PAYMENT_ID, status, ...extra });
+
+  /** POST answers `created()`, every GET /payments answers `statusFor(n)`. */
+  function handoffSetup(statusFor) {
+    const timers = [];
+    let gets = 0;
+    const ctx = setup(
+      (url, opts) => (opts.method === "POST" ? created() : statusFor(++gets)),
+      { setTimer: (fn, ms) => timers.push({ fn, ms }), checkoutTimeoutMs: 1234 },
+    );
+    return { ...ctx, timers };
+  }
+
+  it("arms a checkout timeout only after a successful initiation", async () => {
+    const { controller, timers } = handoffSetup(() => paymentBody("processing"));
+    await controller.payNow({ order: ORDER, paymentMethod: "upi" });
+    assert.equal(timers.length, 1);
+    assert.equal(timers[0].ms, 1234);
+
+    const failing = setup(() => jsonResponse(502, { error: { message: "down" } }), { setTimer: (fn) => timers.push({ fn }) });
+    await failing.controller.payNow({ order: ORDER, paymentMethod: "upi" });
+    assert.equal(timers.length, 1);
+    assert.deepEqual(failing.navigations, []);
+  });
+
+  for (const [backend, shown] of [["processing", "pending"], ["pending", "pending"], ["failed", "failed"]]) {
+    it(`abandoned checkout (backend ${backend}) ends on ${shown} instead of hanging, and unlocks Pay Now`, async () => {
+      const { controller, calls, views, timers } = handoffSetup(() =>
+        paymentBody(backend, { failure_reason: backend === "failed" ? "Checkout abandoned" : null }),
+      );
+      await controller.payNow({ order: ORDER, paymentMethod: "upi" });
+      assert.equal(controller.isInFlight(), true);
+
+      await timers[0].fn(); // customer never came back from the gateway in time
+      const last = views.at(-1);
+      assert.equal(last.kind, "confirmed");
+      assert.equal(last.result.kind, shown);
+      assert.equal(last.submitting, false);
+      assert.equal(calls.at(-1).url, `/api/v1/payments/${PAYMENT_ID}`); // the id from initiation
+      assert.equal(controller.isInFlight(), false);
+      if (shown === "failed") assert.equal(last.result.message, "Checkout abandoned");
+    });
+  }
+
+  it("a success confirmed after return keeps Pay Now locked (no second charge)", async () => {
+    const storage = memoryStorage();
+    storage.setItem(paymentIdStorageKey(ORDER.id), PAYMENT_ID);
+    const ctx = setup((url, opts) => (opts.method === "POST" ? created() : paymentBody("success")), { storage });
+    const result = await ctx.controller.resume(ORDER.id);
+    assert.equal(result.kind, "success");
+    assert.equal(ctx.views.at(-1).locked, true);
+    const again = await ctx.controller.payNow({ order: ORDER, paymentMethod: "upi" });
+    assert.deepEqual(again, { ignored: true });
+    assert.equal(ctx.calls.filter((c) => c.options.method === "POST").length, 0);
+  });
+
+  it("returning via Back (resume) confirms the stored payment and cancels the pending timeout check", async () => {
+    const { controller, calls, views, timers } = handoffSetup(() => paymentBody("pending"));
+    await controller.payNow({ order: ORDER, paymentMethod: "upi" });
+    await controller.resume(ORDER.id);
+    assert.equal(views.at(-1).result.kind, "pending");
+    assert.equal(controller.isInFlight(), false);
+    const getsBefore = calls.length;
+    await timers[0].fn(); // already handled: no second status call
+    assert.equal(calls.length, getsBefore);
+  });
+
+  it("resume without a previous attempt sends nothing and leaves Pay Now usable", async () => {
+    const { controller, calls } = setup(() => created());
+    assert.equal(await controller.resume(ORDER.id), null);
+    assert.equal(calls.length, 0);
+    assert.equal(controller.isInFlight(), false);
+  });
+
+  it("an unknown paymentId on return is shown as an error, never as success", async () => {
+    const storage = memoryStorage();
+    storage.setItem(paymentIdStorageKey(ORDER.id), PAYMENT_ID);
+    const ctx = setup(() => jsonResponse(404, { error: { code: "payment_not_found", message: "Payment not found" } }), { storage });
+    const result = await ctx.controller.resume(ORDER.id);
+    assert.equal(result.kind, "error");
+    assert.equal(ctx.controller.isInFlight(), false);
+  });
+
+  it("result page polling re-checks while pending and stops at the confirmed result", async () => {
+    const statuses = ["pending", "processing", "success"];
+    const { fetch, calls } = fakeFetch((u, o, n) => paymentBody(statuses[n - 1]));
+    const seen = [];
+    const sleeps = [];
+    const view = await pollConfirmedStatus({
+      api: createApi(fetch), paymentId: PAYMENT_ID, gatewayHint: "failed",
+      onUpdate: (v) => seen.push(v.kind), sleep: async (ms) => sleeps.push(ms), intervalMs: 7,
+    });
+    assert.equal(view.kind, "success");
+    assert.equal(view.overridden, true); // the backend wins over the redirect hint
+    assert.deepEqual(seen, ["pending", "pending", "success"]);
+    assert.equal(calls.length, 3);
+    assert.deepEqual(sleeps, [7, 7]);
+  });
+
+  it("result page polling is bounded: a status that stays pending ends on Pending", async () => {
+    const { fetch, calls } = fakeFetch(() => paymentBody("processing"));
+    const view = await pollConfirmedStatus({ api: createApi(fetch), paymentId: PAYMENT_ID, sleep: async () => {}, attempts: 4 });
+    assert.equal(view.kind, "pending");
+    assert.equal(calls.length, 4);
+  });
+
+  it("result page polling stops at once on an error or failure", async () => {
+    for (const response of [jsonResponse(404, {}), paymentBody("failed", { failure_reason: "Declined" })]) {
+      const { fetch, calls } = fakeFetch(() => response);
+      const view = await pollConfirmedStatus({ api: createApi(fetch), paymentId: PAYMENT_ID, sleep: async () => {} });
+      assert.ok(["error", "failed"].includes(view.kind));
+      assert.equal(calls.length, 1);
+    }
+  });
+
+  it("a status request that never answers times out into a network error view", async () => {
+    let signal;
+    const hanging = (url, options) => {
+      signal = options.signal;
+      return new Promise(() => {});
+    };
+    const view = await confirmPaymentStatus({ api: createApi(hanging, "", { timeoutMs: 20 }), paymentId: PAYMENT_ID });
+    assert.equal(view.kind, "network");
+    assert.equal(signal.aborted, true);
   });
 });
 

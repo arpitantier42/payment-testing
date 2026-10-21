@@ -56,8 +56,29 @@ function showOrderUnavailable(text) {
   showMessage("error", text);
 }
 
+const RETURN_TEXT = {
+  success: "Your payment was successful. No further payment is needed.",
+  pending: "Your payment is pending confirmation. We'll show the final result once the payment provider confirms it.",
+};
+
+function resultLink(paymentId) {
+  return `result.html?orderId=${encodeURIComponent(orderId)}&paymentId=${encodeURIComponent(paymentId)}`;
+}
+
+// Back from (or never reached) the gateway checkout: show the backend-confirmed status.
+function renderConfirmed({ result, paymentId }) {
+  const kind = ["success", "pending", "failed"].includes(result.kind) ? result.kind : "error";
+  showMessage(kind, RETURN_TEXT[kind] || result.message);
+  if (kind === "success" || kind === "pending") {
+    const link = document.createElement("a");
+    link.href = resultLink(paymentId);
+    link.textContent = " View payment status";
+    els.message.append(link);
+  }
+}
+
 function render(view) {
-  els.button.disabled = Boolean(view.submitting) || !order;
+  els.button.disabled = Boolean(view.submitting) || Boolean(view.locked) || !order;
   els.button.textContent = view.submitting ? "Processing…" : "Pay Now";
   switch (view.kind) {
     case "validation":
@@ -71,12 +92,17 @@ function render(view) {
     case "redirecting":
       showMessage("info", "Taking you to the secure checkout…");
       break;
+    case "confirmed":
+      renderConfirmed(view);
+      break;
     default:
       els.message.hidden = true;
   }
   // The backend answered: reload the order so a retry gets the key it now issues
   // (a fresh one if this attempt failed, the same one otherwise).
-  if (view.kind === "failed" || view.kind === "api") loadOrder({ keepMessage: true });
+  if (view.kind === "failed" || view.kind === "api" || (view.kind === "confirmed" && view.result.kind === "failed")) {
+    loadOrder({ keepMessage: true });
+  }
 }
 
 const controller = createPayNowController({
@@ -125,4 +151,14 @@ async function loadOrder({ keepMessage = false } = {}) {
 }
 
 els.button.disabled = true;
-loadOrder();
+loadOrder().then(() => {
+  // A previous attempt for this order (e.g. checkout abandoned and the page reopened):
+  // show its confirmed status rather than a blank form or an endless "Processing…".
+  if (order) controller.resume(orderId);
+});
+
+// Back button from the gateway restores this page from the back/forward cache with
+// Pay Now still "Processing…": confirm the status with the backend instead of hanging.
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted && order) controller.resume(orderId);
+});

@@ -46,13 +46,32 @@ export function formatAmount(amount, currency) {
 
 // --- API client ----------------------------------------------------------------
 
-export function createApi(fetchImpl, baseUrl = "") {
+export const REQUEST_TIMEOUT_MS = 15000;
+
+/**
+ * API client. A request that gets no answer within `timeoutMs` is aborted and reported
+ * as a NetworkError, so no view ever waits on the network indefinitely.
+ */
+export function createApi(fetchImpl, baseUrl = "", { timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
   async function request(path, options = {}) {
     let response;
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    let timer = null;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        if (controller) controller.abort();
+        reject(new Error(`no response within ${timeoutMs} ms`));
+      }, timeoutMs);
+    });
     try {
-      response = await fetchImpl(`${baseUrl}${path}`, options);
+      response = await Promise.race([
+        fetchImpl(`${baseUrl}${path}`, controller ? { ...options, signal: controller.signal } : options),
+        timeout,
+      ]);
     } catch (err) {
       throw new NetworkError(err);
+    } finally {
+      clearTimeout(timer);
     }
     let body = null;
     try {
@@ -126,8 +145,31 @@ export const paymentIdStorageKey = (orderId) => `payment:id:${orderId}`;
  *   to receive a fresh key.
  * - Surfaces every failed call as an error view; never proceeds silently.
  */
-export function createPayNowController({ api, storage, navigate, render }) {
+export const CHECKOUT_TIMEOUT_MS = 10 * 60 * 1000;
+
+export function createPayNowController({
+  api,
+  storage,
+  navigate,
+  render,
+  setTimer = (fn, ms) => setTimeout(fn, ms),
+  checkoutTimeoutMs = CHECKOUT_TIMEOUT_MS,
+}) {
   let inFlight = false;
+  let handoffPaymentId = null;
+
+  /**
+   * The customer is back from (or never reached) the gateway checkout: ask the backend for
+   * the confirmed status and show it (Success / Pending / Failed), unlocking Pay Now unless
+   * the payment succeeded. Never shows a status the backend did not confirm.
+   */
+  async function confirmReturn(paymentId) {
+    handoffPaymentId = null;
+    const result = await confirmPaymentStatus({ api, paymentId, gatewayHint: null });
+    inFlight = result.kind === "success"; // a paid order stays locked
+    render({ kind: "confirmed", submitting: false, locked: inFlight, result, paymentId });
+    return result;
+  }
 
   async function payNow({ order, paymentMethod }) {
     if (inFlight) return { ignored: true };
@@ -158,8 +200,12 @@ export function createPayNowController({ api, storage, navigate, render }) {
         });
         return { sent: true, payment };
       }
-      // Stay "in flight": the page is leaving for the gateway checkout.
+      // Stay "in flight": the page is leaving for the gateway checkout. If the page is
+      // still here after the timeout (checkout blocked, abandoned, or the tab restored),
+      // fall back to the confirmed status instead of spinning indefinitely (HLD NFR-006).
       render({ kind: "redirecting", submitting: true, paymentId: payment.id });
+      handoffPaymentId = payment.id;
+      setTimer(() => (handoffPaymentId === payment.id ? confirmReturn(payment.id) : null), checkoutTimeoutMs);
       navigate(payment.gateway_checkout_url);
       return { sent: true, payment };
     } catch (err) {
@@ -174,7 +220,18 @@ export function createPayNowController({ api, storage, navigate, render }) {
     }
   }
 
-  return { payNow, isInFlight: () => inFlight };
+  /** Called when the pay page is shown again (load, or restored via Back) for this order. */
+  async function resume(orderId) {
+    const paymentId = orderId ? storage.getItem(paymentIdStorageKey(orderId)) : null;
+    if (!paymentId) {
+      inFlight = false;
+      handoffPaymentId = null;
+      return null;
+    }
+    return confirmReturn(paymentId);
+  }
+
+  return { payNow, resume, confirmReturn, isInFlight: () => inFlight };
 }
 
 // --- confirmed result --------------------------------------------------------------------
@@ -235,4 +292,31 @@ export async function confirmPaymentStatus({ api, paymentId, gatewayHint }) {
     overridden: reported !== null && reported !== status,
     message: status === "failed" ? payment.failure_reason || "Your payment failed." : undefined,
   };
+}
+
+export const POLL_ATTEMPTS = 5;
+export const POLL_INTERVAL_MS = 3000;
+
+/**
+ * Confirm the status, re-asking while it is still pending, for at most `attempts` calls.
+ * Every call's view is passed to `onUpdate`, and the last one is returned: the page always
+ * ends on a definite Success / Failed / Pending / error view and never polls forever.
+ */
+export async function pollConfirmedStatus({
+  api,
+  paymentId,
+  gatewayHint,
+  onUpdate = () => {},
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  attempts = POLL_ATTEMPTS,
+  intervalMs = POLL_INTERVAL_MS,
+}) {
+  let view;
+  for (let i = 0; i < attempts; i += 1) {
+    if (i > 0) await sleep(intervalMs);
+    view = await confirmPaymentStatus({ api, paymentId, gatewayHint });
+    onUpdate(view);
+    if (view.kind !== "pending") break;
+  }
+  return view;
 }
